@@ -3,7 +3,7 @@ import { Tldraw } from 'tldraw'
 import 'tldraw/tldraw.css'
 import './App.css'
 import { startAudioCapture } from './lib/audioCapture'
-import { renderSchema } from './lib/diagramRender'
+import { createRenderState, renderSchema } from './lib/diagramRender'
 
 const WS_URL = import.meta.env.VITE_WS_URL || 'ws://localhost:8000/ws/audio'
 
@@ -11,6 +11,7 @@ export default function App() {
   const editorRef = useRef(null)
   const wsRef = useRef(null)
   const stopCaptureRef = useRef(null)
+  const renderStateRef = useRef(createRenderState())
   const [status, setStatus] = useState('idle') // idle | connecting | listening | error
 
   const handleMount = useCallback((editor) => {
@@ -27,6 +28,10 @@ export default function App() {
 
   const start = useCallback(async () => {
     setStatus('connecting')
+    // Each session gets its own backend-tracked diagram state (see
+    // backend/server.py), so the frontend's picture of "what's already
+    // drawn" needs to reset alongside it.
+    renderStateRef.current = createRenderState()
     const ws = new WebSocket(WS_URL)
     ws.binaryType = 'arraybuffer'
     wsRef.current = ws
@@ -45,7 +50,7 @@ export default function App() {
     ws.onmessage = (event) => {
       const schema = JSON.parse(event.data)
       if (editorRef.current) {
-        renderSchema(editorRef.current, schema)
+        renderSchema(editorRef.current, schema, renderStateRef.current)
       }
     }
 

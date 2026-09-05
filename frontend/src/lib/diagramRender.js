@@ -8,20 +8,50 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
-// Renders a {diagram_type, nodes, edges} schema onto the tldraw canvas,
-// creating one shape at a time so the diagram visibly draws itself instead
-// of popping in all at once - masks the latency of schema generation.
-export async function renderSchema(editor, schema) {
-  if (!schema || schema.diagram_type === 'none' || !schema.nodes?.length) {
+function edgeKey(edge) {
+  return `${edge.from}->${edge.to}`
+}
+
+// Tracks what's already been drawn for one canvas across repeated
+// renderSchema() calls, so a later "extend" schema only adds what's new
+// instead of redrawing everything. Create one per canvas/session.
+export function createRenderState() {
+  return { shapeIds: {}, drawnEdgeKeys: new Set() }
+}
+
+// Renders a {action, diagram_type, nodes, edges} schema onto the tldraw
+// canvas. `schema` is always the FULL diagram as understood so far (the
+// backend merges extend/new itself) - this function diffs against `state`
+// to figure out what's actually new, and only creates those shapes, one at
+// a time, so the diagram visibly draws itself instead of popping in all at
+// once. On action "new" the canvas (and state) is cleared first.
+export async function renderSchema(editor, schema, state) {
+  if (!schema) return
+
+  if (schema.action === 'new') {
+    const existingIds = Array.from(editor.getCurrentPageShapeIds())
+    if (existingIds.length) editor.deleteShapes(existingIds)
+    state.shapeIds = {}
+    state.drawnEdgeKeys = new Set()
+  }
+
+  if (schema.diagram_type === 'none' || !schema.nodes?.length) {
     return
   }
 
+  // Laying out the full graph on every call (not just the new nodes) keeps
+  // new nodes positioned sensibly relative to old ones, at the cost of
+  // recomputing positions for nodes that are already drawn - those aren't
+  // moved, so as the diagram grows a later layout pass can drift from
+  // where earlier nodes actually ended up. Fine for a prototype; a stable
+  // incremental layout is future work.
   const boxes = layoutSchema(schema)
-  const shapeIds = {}
 
   for (const node of schema.nodes) {
+    if (state.shapeIds[node.id]) continue // already drawn
+
     const id = createShapeId()
-    shapeIds[node.id] = id
+    state.shapeIds[node.id] = id
     const box = boxes[node.id]
 
     editor.createShape({
@@ -40,9 +70,13 @@ export async function renderSchema(editor, schema) {
   }
 
   for (const edge of schema.edges) {
-    const fromShapeId = shapeIds[edge.from]
-    const toShapeId = shapeIds[edge.to]
+    const key = edgeKey(edge)
+    if (state.drawnEdgeKeys.has(key)) continue
+
+    const fromShapeId = state.shapeIds[edge.from]
+    const toShapeId = state.shapeIds[edge.to]
     if (!fromShapeId || !toShapeId) continue
+    state.drawnEdgeKeys.add(key)
 
     const arrowId = createShapeId()
     const fromBox = boxes[edge.from]
