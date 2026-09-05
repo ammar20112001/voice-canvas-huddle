@@ -3,3 +3,5 @@ sounddevice
 webrtcvad
 numpy
 anthropic
+python-dotenv
+setuptools
