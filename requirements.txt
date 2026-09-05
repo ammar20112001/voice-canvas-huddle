@@ -5,3 +5,5 @@ numpy
 anthropic
 python-dotenv
 setuptools
+fastapi
+uvicorn[standard]
