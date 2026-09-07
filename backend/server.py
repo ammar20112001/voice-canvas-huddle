@@ -7,6 +7,12 @@ WebSocket bridge between a browser mic and the voice -> diagram-schema pipeline.
                        plus whether the latest utterance extended it or
                        replaced it ("extend" | "new")
 
+Drawing is voice-gated ("Jarvis"): nothing gets drawn until the wake phrase
+"Start drawing Jarvis" is heard, and drawing stops again on "Stop building
+Jarvis" (see is_wake_phrase()/is_sleep_phrase() in backend/pipeline.py).
+Everything said outside that window is kept as background context so Jarvis
+still understands what's being discussed once it's turned on.
+
 Run:
   uvicorn backend.server:app --reload --port 8000
   (from the repo root, with ANTHROPIC_API_KEY set or in a .env file)
@@ -22,7 +28,14 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
-from backend.pipeline import DiagramAgent, Segmenter, Transcriber, looks_complete
+from backend.pipeline import (
+    DiagramAgent,
+    Segmenter,
+    Transcriber,
+    is_sleep_phrase,
+    is_wake_phrase,
+    looks_complete,
+)
 
 load_dotenv()
 
@@ -84,6 +97,14 @@ async def audio_socket(ws: WebSocket):
     # Full diagram state as understood so far this connection - handed back
     # to the LLM each turn so it can decide whether to extend or replace it.
     current_diagram = {"diagram_type": "none", "nodes": [], "edges": []}
+    # Jarvis only draws between a wake phrase ("Start drawing Jarvis") and a
+    # sleep phrase ("Stop building Jarvis") - see backend/pipeline.py's
+    # is_wake_phrase()/is_sleep_phrase(). Everything transcribed outside
+    # that window (or while a multi-chunk instruction is still assembling)
+    # is kept as background_context instead of being drawn.
+    active = False
+    transcript_log = []
+    pending_start_idx = 0  # index into transcript_log where the current pending_text began
 
     try:
         while True:
@@ -99,6 +120,31 @@ async def audio_socket(ws: WebSocket):
                     log.info("[PIPE] empty transcription, discarding utterance")
                     continue
 
+                if is_wake_phrase(text):
+                    transcript_log.append(text)
+                    if not active:
+                        active = True
+                        pending_text = ""
+                        log.info(f"[JARVIS] wake phrase in \"{text}\" - now active")
+                    continue
+
+                if is_sleep_phrase(text):
+                    transcript_log.append(text)
+                    if active:
+                        active = False
+                        pending_text = ""
+                        log.info(f"[JARVIS] sleep phrase in \"{text}\" - now inactive")
+                    continue
+
+                if not active:
+                    transcript_log.append(text)
+                    log.info(f"[JARVIS] inactive, logged as background context: \"{text}\"")
+                    continue
+
+                if not pending_text:
+                    pending_start_idx = len(transcript_log)
+                transcript_log.append(text)
+
                 combined = (pending_text + " " + text).strip() if pending_text else text
                 if pending_text:
                     log.info(f"[PIPE] merged with pending text -> \"{combined}\"")
@@ -112,7 +158,8 @@ async def audio_socket(ws: WebSocket):
                     continue
 
                 pending_text = ""
-                schema = await asyncio.to_thread(_agent.generate, combined, current_diagram)
+                background_context = "\n".join(transcript_log[:pending_start_idx])
+                schema = await asyncio.to_thread(_agent.generate, combined, current_diagram, background_context)
                 prev_node_count = len(current_diagram["nodes"])
                 prev_edge_count = len(current_diagram["edges"])
                 current_diagram = _merge_diagram(current_diagram, schema)

@@ -11,6 +11,7 @@ Shared by:
   backend/server.py    - WebSocket server, receives PCM16 chunks from a browser
 """
 
+import difflib
 import json
 import logging
 import re
@@ -41,18 +42,29 @@ TRAILING_FILLER_WORDS = {
     "so", "that", "which", "but", "then", "into", "like", "as", "is", "are",
 }
 
+# Wake word for voice control of drawing - see is_wake_phrase()/is_sleep_phrase().
+WAKE_WORD = "jarvis"
+WAKE_WORD_SIMILARITY = 0.7          # difflib ratio threshold for a fuzzy "jarvis" match
+WAKE_PHRASE_RE = re.compile(r"\bstart\w*\b.{0,12}?\bdraw\w*\b", re.IGNORECASE)
+SLEEP_PHRASE_RE = re.compile(r"\bstop\w*\b.{0,12}?\bbuild\w*\b", re.IGNORECASE)
+
 SYSTEM_PROMPT = """You maintain a structured diagram across a series of spoken instructions.
 
-Each message gives you JSON with two fields:
+Each message gives you JSON with three fields:
   "current_diagram": the diagram as drawn so far - {diagram_type, nodes, edges}
     (empty if nothing has been drawn yet).
+  "background_context": earlier conversation not yet reflected in the
+    diagram - things said before drawing was turned on, or between
+    instructions - that may explain what's being built or why (empty if
+    there's none).
   "instruction": the newest spoken instruction to incorporate.
 
 First decide: does this instruction continue the current diagram (add detail,
 reference existing nodes, extend the same topic), or does it describe
 something unrelated that should replace it with a fresh diagram? Use
-judgment - most instructions extend; only start fresh when the subject has
-clearly changed.
+judgment, and use background_context to understand the instruction, not as
+something to draw by itself - most instructions extend; only start fresh
+when the subject has clearly changed.
 
 Output ONLY valid JSON, no prose, no markdown fences, matching this shape:
 {
@@ -184,6 +196,28 @@ class Transcriber:
         return text
 
 
+# ---------------- Wake / sleep phrase detection ----------------
+def _mentions_wake_word(text: str) -> bool:
+    """Fuzzy match instead of exact spelling - "Jarvis" is exactly the kind
+    of proper noun a small ASR model mishears (Jarviss, Jarves, Jervis...)."""
+    for word in re.findall(r"[a-zA-Z']+", text.lower()):
+        if difflib.SequenceMatcher(None, word, WAKE_WORD).ratio() >= WAKE_WORD_SIMILARITY:
+            return True
+    return False
+
+
+def is_wake_phrase(text: str) -> bool:
+    """"Start drawing Jarvis" (tolerant of word order, verb tense, and
+    misspellings of the name) - turns drawing on."""
+    return bool(WAKE_PHRASE_RE.search(text)) and _mentions_wake_word(text)
+
+
+def is_sleep_phrase(text: str) -> bool:
+    """"Stop building Jarvis" (same tolerance as is_wake_phrase) - turns
+    drawing back off."""
+    return bool(SLEEP_PHRASE_RE.search(text)) and _mentions_wake_word(text)
+
+
 # ---------------- Completeness heuristic ----------------
 def looks_complete(text: str) -> tuple[bool, str]:
     """Returns (is_complete, reason) so the caller can log *why*."""
@@ -203,11 +237,21 @@ class DiagramAgent:
     def __init__(self, api_key: str):
         self.client = anthropic.Anthropic(api_key=api_key)
 
-    def generate(self, instruction: str, current_diagram: dict) -> dict:
-        user_content = json.dumps({"current_diagram": current_diagram, "instruction": instruction})
+    def generate(self, instruction: str, current_diagram: dict, background_context: str = "") -> dict:
+        payload = {
+            "current_diagram": current_diagram,
+            "background_context": background_context,
+            "instruction": instruction,
+        }
+        user_content = json.dumps(payload)
         log.info(
             f"[LLM] sending to {LLM_MODEL}: current diagram has "
-            f"{len(current_diagram.get('nodes', []))} node(s) -> \"{instruction}\""
+            f"{len(current_diagram.get('nodes', []))} node(s), "
+            f"{len(background_context)} char(s) of background context -> \"{instruction}\""
+        )
+        log.info(
+            f"[LLM] full prompt:\n--- system ---\n{SYSTEM_PROMPT}\n"
+            f"--- user ---\n{json.dumps(payload, indent=2)}"
         )
         t0 = time.perf_counter()
         resp = self.client.messages.create(
@@ -222,7 +266,7 @@ class DiagramAgent:
             f"[LLM] response in {elapsed:.2f}s "
             f"(in={resp.usage.input_tokens} tok, out={resp.usage.output_tokens} tok)"
         )
-        log.debug(f"[LLM] raw response body:\n{raw}")
+        log.info(f"[LLM] raw response body:\n{raw}")
 
         cleaned = re.sub(r"^```json|```$", "", raw, flags=re.MULTILINE).strip()
         try:
