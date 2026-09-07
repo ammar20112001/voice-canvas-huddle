@@ -13,6 +13,12 @@ Jarvis" (see is_wake_phrase()/is_sleep_phrase() in backend/pipeline.py).
 Everything said outside that window is kept as background context so Jarvis
 still understands what's being discussed once it's turned on.
 
+The diagram, transcript, and Jarvis on/off state live in a process-global
+_SessionState (below), not per-connection locals - a dropped connection or a
+deliberate Stop/Start from the frontend resumes the same session instead of
+starting a blank one. On (re)connect, if a diagram already exists, it's sent
+immediately so a freshly (re)loaded frontend can restore it.
+
 Run:
   uvicorn backend.server:app --reload --port 8000
   (from the repo root, with ANTHROPIC_API_KEY set or in a .env file)
@@ -66,6 +72,22 @@ _transcriber = Transcriber()
 _agent = DiagramAgent(_api_key)
 
 
+class _SessionState:
+    """Everything that should survive a WebSocket reconnect. Process-global
+    because this prototype only ever serves one client at a time - real
+    multi-client support would key this by a session id from the frontend
+    instead of sharing one instance."""
+
+    def __init__(self):
+        self.current_diagram = {"diagram_type": "none", "nodes": [], "edges": []}
+        self.active = False
+        self.transcript_log = []
+        self.draw_marker_indices = []
+
+
+_session = _SessionState()
+
+
 def _merge_diagram(current: dict, schema: dict) -> dict:
     """Applies the LLM's action to the running diagram state. "extend" trusts
     the model to have sent only new nodes/edges (deduped defensively by id
@@ -92,10 +114,6 @@ async def audio_socket(ws: WebSocket):
     await ws.accept()
     log.info("[WS] client connected")
 
-    segmenter = Segmenter()
-    # Full diagram state as understood so far this connection - handed back
-    # to the LLM each turn so it can decide whether to extend or replace it.
-    current_diagram = {"diagram_type": "none", "nodes": [], "edges": []}
     # Jarvis only draws between a wake phrase ("Start drawing Jarvis") and a
     # sleep phrase ("Stop building Jarvis") - see backend/pipeline.py's
     # is_wake_phrase()/is_sleep_phrase(). Everything transcribed outside
@@ -107,13 +125,19 @@ async def audio_socket(ws: WebSocket):
     # per-turn whether a fragment is drawable yet (falling back to a no-op
     # extend when it isn't), which is both faster and more accurate than a
     # regex completeness heuristic.
-    active = False
-    transcript_log = []
-    # Index into transcript_log recorded right after each draw that actually
-    # changed current_diagram - lets build_background_context() show the LLM
-    # exactly how far the transcript had gotten each time the diagram was
-    # last updated, instead of one undifferentiated blob of prior speech.
-    draw_marker_indices = []
+    #
+    # All of that state lives on the shared _session (see _SessionState),
+    # not as locals here, so it survives this connection ending.
+    if _session.current_diagram["nodes"]:
+        log.info(
+            f"[WS] resuming persisted session - {len(_session.current_diagram['nodes'])} "
+            f"node(s), active={_session.active}"
+        )
+        await ws.send_json({"action": "new", **_session.current_diagram})
+
+    # Per-connection: audio buffering/timing has no meaning across a drop,
+    # so this - unlike _session - starts fresh every time.
+    segmenter = Segmenter()
 
     try:
         while True:
@@ -143,35 +167,35 @@ async def audio_socket(ws: WebSocket):
                         continue
 
                     if is_wake_phrase(text):
-                        transcript_log.append(text)
-                        if not active:
-                            active = True
+                        _session.transcript_log.append(text)
+                        if not _session.active:
+                            _session.active = True
                             log.info(f"[JARVIS] wake phrase in \"{text}\" - now active")
                         continue
 
                     if is_sleep_phrase(text):
-                        transcript_log.append(text)
-                        if active:
-                            active = False
+                        _session.transcript_log.append(text)
+                        if _session.active:
+                            _session.active = False
                             log.info(f"[JARVIS] sleep phrase in \"{text}\" - now inactive")
                         continue
 
-                    if not active:
-                        transcript_log.append(text)
+                    if not _session.active:
+                        _session.transcript_log.append(text)
                         log.info(f"[JARVIS] inactive, logged as background context: \"{text}\"")
                         continue
 
-                    background_context = build_background_context(transcript_log, draw_marker_indices)
-                    transcript_log.append(text)
-                    schema = await asyncio.to_thread(_agent.generate, text, current_diagram, background_context)
-                    prev_node_count = len(current_diagram["nodes"])
-                    prev_edge_count = len(current_diagram["edges"])
-                    current_diagram = _merge_diagram(current_diagram, schema)
+                    background_context = build_background_context(_session.transcript_log, _session.draw_marker_indices)
+                    _session.transcript_log.append(text)
+                    schema = await asyncio.to_thread(_agent.generate, text, _session.current_diagram, background_context)
+                    prev_node_count = len(_session.current_diagram["nodes"])
+                    prev_edge_count = len(_session.current_diagram["edges"])
+                    _session.current_diagram = _merge_diagram(_session.current_diagram, schema)
                     total = time.perf_counter() - pipeline_t0
                     log.info(
                         f"[PIPE] total time from utterance end to schema ready: {total:.2f}s, "
-                        f"diagram now has {len(current_diagram['nodes'])} node(s), "
-                        f"{len(current_diagram['edges'])} edge(s)"
+                        f"diagram now has {len(_session.current_diagram['nodes'])} node(s), "
+                        f"{len(_session.current_diagram['edges'])} edge(s)"
                     )
 
                     # Not every complete-sounding fragment is drawable (small
@@ -181,15 +205,15 @@ async def audio_socket(ws: WebSocket):
                     # redraw/re-zoom for no reason.
                     changed = (
                         schema.get("action") == "new"
-                        or len(current_diagram["nodes"]) != prev_node_count
-                        or len(current_diagram["edges"]) != prev_edge_count
+                        or len(_session.current_diagram["nodes"]) != prev_node_count
+                        or len(_session.current_diagram["edges"]) != prev_edge_count
                     )
                     if not changed:
                         log.info("[PIPE] no drawable change, keeping diagram as is")
                         continue
 
-                    draw_marker_indices.append(len(transcript_log))
-                    await ws.send_json({"action": schema.get("action", "new"), **current_diagram})
+                    _session.draw_marker_indices.append(len(_session.transcript_log))
+                    await ws.send_json({"action": schema.get("action", "new"), **_session.current_diagram})
                 except (WebSocketDisconnect, asyncio.CancelledError):
                     raise
                 except Exception:
