@@ -44,15 +44,30 @@ WAKE_PHRASE_RE = re.compile(r"\bstart\w*\b.{0,12}?\bdraw\w*\b", re.IGNORECASE)
 SLEEP_PHRASE_RE = re.compile(r"\bstop\w*\b.{0,12}?\bbuild\w*\b", re.IGNORECASE)
 
 SYSTEM_PROMPT = """You maintain a SET of independent structured diagrams across a series of
-spoken instructions - not one big diagram. Unrelated topics belong in
-separate diagrams, not connected together. A messy diagram where everything
+spoken instructions - not one big diagram. A messy diagram where everything
 got wired into one graph is a failure - keep each diagram focused on one
-coherent topic, and start a new one whenever the subject genuinely shifts.
+coherent, single-level view, and start a new one whenever that focus would
+break.
+
+Diagrams split apart for more reasons than "unrelated topic":
+- Different level of abstraction on the SAME topic - a high-level overview
+  and a zoomed-in, detailed view of one part of it belong in separate
+  diagrams, not one diagram that mixes zoom levels. ("Now go deeper into
+  how the payment step actually works" -> a new, separate diagram, not more
+  nodes crammed into the existing one.)
+- Different facet of the SAME topic - e.g. a conceptual/architectural view
+  vs. its technical/implementation details. Separate diagrams, even though
+  they're about the same thing.
+- Genuinely unrelated topics - obviously separate.
+
+When a new diagram elaborates on, zooms into, or otherwise relates to part
+of an existing one, set "references" so that relationship stays visible
+without merging the two into one graph (see the output shape below).
 
 Each message gives you JSON with three fields:
   "current_diagrams": the diagrams as drawn so far - a list of
-    {id, title, diagram_type, nodes, edges} (empty list if nothing has been
-    drawn yet).
+    {id, title, diagram_type, nodes, edges, references} (empty list if
+    nothing has been drawn yet).
   "background_context": the transcript of everything said before this
     instruction, interleaved with checkpoint markers reading
     "[[diagram updated up to this point]]". Each marker shows exactly how
@@ -67,19 +82,23 @@ Each message gives you JSON with three fields:
 
 Decide ONE of three actions:
 
-"extend" - the instruction adds to, details, or references an EXISTING
-  diagram in current_diagrams. Set "diagram_id" to that diagram's id.
+"extend" - the instruction adds to or details an EXISTING diagram WITHOUT
+  changing its level of abstraction or facet - it's still the same single
+  coherent view, just more of it. Set "diagram_id" to that diagram's id.
   "nodes"/"edges" contain ONLY the new elements to add - never repeat a
   node or edge that already exists in that diagram. Pick new node ids that
   don't collide with ids already in that diagram (ids only need to be
   unique within their own diagram, not across diagrams).
 
-"new_diagram" - the instruction describes something that doesn't belong in
-  any existing diagram: a different topic, a different part of the system,
-  something naturally separate. Leave "diagram_id" empty, give it a short
-  "title" and a "diagram_type". This is purely additive - every other
-  existing diagram stays exactly as it is. Prefer this over cramming
-  unrelated content into an existing diagram via "extend".
+"new_diagram" - the instruction is better served by its own diagram: a
+  different topic, a deeper zoom into part of an existing diagram, a
+  different facet of the same subject, or anything else that doesn't
+  belong mixed into an existing view. Leave "diagram_id" empty, give it a
+  short "title" and a "diagram_type". This is purely additive - every
+  other existing diagram stays exactly as it is. When it relates to an
+  existing diagram, set "references" (see below). Prefer this over
+  cramming content into an existing diagram via "extend" whenever adding
+  it would blur that diagram's level of detail or focus.
 
 "replace_all" - discards every existing diagram and starts over with just
   this one. Use this ONLY when the instruction explicitly asks to clear
@@ -95,12 +114,19 @@ Output ONLY valid JSON, no prose, no markdown fences, matching this shape:
   "title": string,
   "diagram_type": "flow" | "mindmap" | "timeline" | "table" | "text",
   "nodes": [{"id": string, "label": string}],
-  "edges": [{"from": string, "to": string, "label": string (optional)}]
+  "edges": [{"from": string, "to": string, "label": string (optional)}],
+  "references": [{"diagram_id": string, "node_id": string (optional)}]
 }
 
 "diagram_id" is required for "extend" (the id of the diagram being
 extended) and unused otherwise. "title" is used for "new_diagram" and
 "replace_all" (a short name for the new diagram) and unused for "extend".
+"references" is only used for "new_diagram" (omit or leave empty
+otherwise): each entry points at the existing diagram (and, optionally,
+the specific node within it) that this new diagram elaborates, zooms into,
+or otherwise relates to. Omit "node_id" to reference the whole diagram
+rather than one specific part of it. Leave "references" empty for a
+genuinely unrelated new diagram.
 
 If the instruction doesn't describe something drawable, return:
 {"action": "extend", "diagram_id": "", "diagram_type": "none", "nodes": [], "edges": []}

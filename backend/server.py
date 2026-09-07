@@ -130,6 +130,22 @@ def _make_diagram_id(title: str, diagrams: list) -> str:
     return candidate
 
 
+def _valid_references(references: list, diagrams: list) -> list:
+    """Drops any reference to a diagram/node the model hallucinated, so a
+    bad id never reaches the frontend as something to render."""
+    diagrams_by_id = {d["id"]: d for d in diagrams}
+    valid = []
+    for ref in references or []:
+        target = diagrams_by_id.get(ref.get("diagram_id"))
+        if target is None:
+            continue
+        node_id = ref.get("node_id")
+        if node_id and not any(n["id"] == node_id for n in target["nodes"]):
+            node_id = None  # referenced node doesn't exist - fall back to whole-diagram
+        valid.append({"diagram_id": target["id"], "node_id": node_id})
+    return valid
+
+
 def _new_diagram_from_schema(schema: dict, diagrams: list) -> dict:
     return {
         "id": _make_diagram_id(schema.get("title"), diagrams),
@@ -137,6 +153,7 @@ def _new_diagram_from_schema(schema: dict, diagrams: list) -> dict:
         "diagram_type": schema.get("diagram_type") or "flow",
         "nodes": schema.get("nodes", []),
         "edges": schema.get("edges", []),
+        "references": _valid_references(schema.get("references", []), diagrams),
     }
 
 

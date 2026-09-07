@@ -5,6 +5,7 @@ const NODE_STAGGER_MS = 150
 const EDGE_STAGGER_MS = 100
 const DIAGRAM_GUTTER = 200 // horizontal gap between separate diagrams' regions
 const TITLE_HEIGHT = 40
+const REFERENCE_LABEL = 'zooms into / relates to'
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms))
@@ -38,6 +39,7 @@ export function getDiagramState(state, diagramId) {
       width: 0,
       title: null,
       diagramType: null,
+      referencesDrawn: false,
     }
   }
   return state.diagrams[diagramId]
@@ -171,6 +173,67 @@ async function drawDiagram(editor, diagram, state) {
         {
           type: 'arrow',
           fromId: arrowId,
+          toId: toShapeId,
+          props: { terminal: 'end', normalizedAnchor: { x: 0.5, y: 0.5 }, isExact: false, isPrecise: false, snap: 'none' },
+        },
+      ])
+    })
+
+    await sleep(EDGE_STAGGER_MS)
+  }
+
+  await drawReferenceLinks(editor, diagram, state)
+}
+
+// Draws a dashed "zooms into / relates to" link from whatever this diagram
+// elaborates on (a specific node in another diagram, or that diagram's
+// title if no specific node) to this diagram's own title - so a low-level
+// detail view or a technical-facet diagram stays visibly connected to what
+// it's about without merging the two into one graph. references only ever
+// arrives on the turn a diagram is first created (see backend/server.py's
+// _new_diagram_from_schema), so this only needs to run once per diagram.
+async function drawReferenceLinks(editor, diagram, state) {
+  const dState = getDiagramState(state, diagram.id)
+  if (dState.referencesDrawn) return
+  dState.referencesDrawn = true
+
+  const toShapeId = dState.titleShapeId
+  if (!toShapeId || !diagram.references?.length) return
+
+  for (const ref of diagram.references) {
+    const targetState = getDiagramState(state, ref.diagram_id)
+    const fromShapeId = ref.node_id ? targetState.shapeIds[ref.node_id] : targetState.titleShapeId
+    if (!fromShapeId) continue
+
+    const fromBounds = editor.getShapePageBounds(fromShapeId)
+    const toBounds = editor.getShapePageBounds(toShapeId)
+    if (!fromBounds || !toBounds) continue
+
+    const linkId = createShapeId()
+    editor.store.mergeRemoteChanges(() => {
+      editor.createShape({
+        id: linkId,
+        type: 'arrow',
+        x: 0,
+        y: 0,
+        props: {
+          start: { x: fromBounds.midX, y: fromBounds.midY },
+          end: { x: toBounds.midX, y: toBounds.midY },
+          color: 'grey',
+          dash: 'dashed',
+          richText: toRichText(REFERENCE_LABEL),
+        },
+      })
+      editor.createBindings([
+        {
+          type: 'arrow',
+          fromId: linkId,
+          toId: fromShapeId,
+          props: { terminal: 'start', normalizedAnchor: { x: 0.5, y: 0.5 }, isExact: false, isPrecise: false, snap: 'none' },
+        },
+        {
+          type: 'arrow',
+          fromId: linkId,
           toId: toShapeId,
           props: { terminal: 'end', normalizedAnchor: { x: 0.5, y: 0.5 }, isExact: false, isPrecise: false, snap: 'none' },
         },
