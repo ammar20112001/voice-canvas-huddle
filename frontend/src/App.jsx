@@ -14,11 +14,11 @@ export default function App() {
   const stopCaptureRef = useRef(null)
   const stopSyncRef = useRef(null)
   // Persists across reconnects rather than resetting in start() - the
-  // backend now keeps its diagram across a drop too (see backend/server.py's
-  // _SessionState) and pushes it back immediately on reconnect, at which
-  // point renderSchema's "new" handling resets this anyway. Not resetting
-  // here means the id mapping stays valid if a reconnect happens without a
-  // full page reload (the canvas never actually went away).
+  // backend now keeps its diagrams across a drop too (see backend/server.py's
+  // _SessionState) and pushes them back immediately on reconnect, at which
+  // point renderSchema's "replace_all" handling resets this anyway. Not
+  // resetting here means the id mapping stays valid if a reconnect happens
+  // without a full page reload (the canvas never actually went away).
   const renderStateRef = useRef(createRenderState())
   const [status, setStatus] = useState('idle') // idle | connecting | listening | error
 
@@ -77,6 +77,12 @@ export default function App() {
     }
   }, [])
 
+  const undo = useCallback(() => {
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({ type: 'undo' }))
+    }
+  }, [])
+
   return (
     <div className="app">
       <div className="controls">
@@ -89,6 +95,9 @@ export default function App() {
             : status === 'connecting'
               ? 'Connecting...'
               : 'Start listening'}
+        </button>
+        <button onClick={undo} disabled={status !== 'listening'} title="Revert the last change (voice or manual)">
+          Undo
         </button>
         <span className={`status status-${status}`}>{status}</span>
       </div>

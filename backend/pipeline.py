@@ -43,49 +43,67 @@ WAKE_WORD_SIMILARITY = 0.7          # difflib ratio threshold for a fuzzy "jarvi
 WAKE_PHRASE_RE = re.compile(r"\bstart\w*\b.{0,12}?\bdraw\w*\b", re.IGNORECASE)
 SLEEP_PHRASE_RE = re.compile(r"\bstop\w*\b.{0,12}?\bbuild\w*\b", re.IGNORECASE)
 
-SYSTEM_PROMPT = """You maintain a structured diagram across a series of spoken instructions.
+SYSTEM_PROMPT = """You maintain a SET of independent structured diagrams across a series of
+spoken instructions - not one big diagram. Unrelated topics belong in
+separate diagrams, not connected together. A messy diagram where everything
+got wired into one graph is a failure - keep each diagram focused on one
+coherent topic, and start a new one whenever the subject genuinely shifts.
 
 Each message gives you JSON with three fields:
-  "current_diagram": the diagram as drawn so far - {diagram_type, nodes, edges}
-    (empty if nothing has been drawn yet).
+  "current_diagrams": the diagrams as drawn so far - a list of
+    {id, title, diagram_type, nodes, edges} (empty list if nothing has been
+    drawn yet).
   "background_context": the transcript of everything said before this
     instruction, interleaved with checkpoint markers reading
     "[[diagram updated up to this point]]". Each marker shows exactly how
-    far into the transcript things stood the moment current_diagram last
-    changed. Text before the LAST marker (or the whole thing, if there's
-    no marker yet) is already reflected in current_diagram - read it only
-    for situational understanding, don't treat it as new material to draw.
+    far into the transcript things stood the moment a diagram last changed.
+    Text before the LAST marker (or the whole thing, if there's no marker
+    yet) is already reflected in current_diagrams - read it only for
+    situational understanding, don't treat it as new material to draw.
     Text after the last marker hasn't produced any diagram change yet and
     may be directly relevant to this instruction (empty if there's no
     context at all).
   "instruction": the newest spoken instruction to incorporate.
 
-First decide: does this instruction continue the current diagram (add detail,
-reference existing nodes, extend the same topic), or does it describe
-something unrelated that should replace it with a fresh diagram? Use
-judgment, and use background_context to understand the instruction, not as
-something to draw by itself - most instructions extend; only start fresh
-when the subject has clearly changed.
+Decide ONE of three actions:
+
+"extend" - the instruction adds to, details, or references an EXISTING
+  diagram in current_diagrams. Set "diagram_id" to that diagram's id.
+  "nodes"/"edges" contain ONLY the new elements to add - never repeat a
+  node or edge that already exists in that diagram. Pick new node ids that
+  don't collide with ids already in that diagram (ids only need to be
+  unique within their own diagram, not across diagrams).
+
+"new_diagram" - the instruction describes something that doesn't belong in
+  any existing diagram: a different topic, a different part of the system,
+  something naturally separate. Leave "diagram_id" empty, give it a short
+  "title" and a "diagram_type". This is purely additive - every other
+  existing diagram stays exactly as it is. Prefer this over cramming
+  unrelated content into an existing diagram via "extend".
+
+"replace_all" - discards every existing diagram and starts over with just
+  this one. Use this ONLY when the instruction explicitly asks to clear
+  everything or start completely over (e.g. "clear everything", "start
+  over", "forget all of this", "erase it all"). This is destructive and
+  the user may not be able to get their work back - when in doubt between
+  "replace_all" and "new_diagram", always choose "new_diagram".
 
 Output ONLY valid JSON, no prose, no markdown fences, matching this shape:
 {
-  "action": "extend" | "new",
+  "action": "extend" | "new_diagram" | "replace_all",
+  "diagram_id": string,
+  "title": string,
   "diagram_type": "flow" | "mindmap" | "timeline" | "table" | "text",
   "nodes": [{"id": string, "label": string}],
   "edges": [{"from": string, "to": string, "label": string (optional)}]
 }
 
-If action is "extend": "nodes" and "edges" contain ONLY the new elements to
-add - never repeat a node or edge that already exists in current_diagram.
-Edges may reference existing node ids from current_diagram as well as ids
-of nodes you're adding now. Pick new node ids that don't collide with any
-id already in current_diagram.
-
-If action is "new": "nodes" and "edges" contain the COMPLETE diagram from
-scratch - ignore current_diagram entirely.
+"diagram_id" is required for "extend" (the id of the diagram being
+extended) and unused otherwise. "title" is used for "new_diagram" and
+"replace_all" (a short name for the new diagram) and unused for "extend".
 
 If the instruction doesn't describe something drawable, return:
-{"action": "extend", "diagram_type": "none", "nodes": [], "edges": []}
+{"action": "extend", "diagram_id": "", "diagram_type": "none", "nodes": [], "edges": []}
 """
 
 
@@ -250,16 +268,15 @@ class DiagramAgent:
     def __init__(self, api_key: str):
         self.client = anthropic.Anthropic(api_key=api_key)
 
-    def generate(self, instruction: str, current_diagram: dict, background_context: str = "") -> dict:
+    def generate(self, instruction: str, current_diagrams: list, background_context: str = "") -> dict:
         payload = {
-            "current_diagram": current_diagram,
+            "current_diagrams": current_diagrams,
             "background_context": background_context,
             "instruction": instruction,
         }
         user_content = json.dumps(payload)
         log.info(
-            f"[LLM] sending to {LLM_MODEL}: current diagram has "
-            f"{len(current_diagram.get('nodes', []))} node(s), "
+            f"[LLM] sending to {LLM_MODEL}: {len(current_diagrams)} existing diagram(s), "
             f"{len(background_context)} char(s) of background context -> \"{instruction}\""
         )
         log.info(
@@ -285,11 +302,19 @@ class DiagramAgent:
         try:
             parsed = json.loads(cleaned)
             log.info(
-                f"[LLM] parsed OK: action={parsed.get('action')}, type={parsed.get('diagram_type')}, "
+                f"[LLM] parsed OK: action={parsed.get('action')}, diagram_id={parsed.get('diagram_id')!r}, "
+                f"type={parsed.get('diagram_type')}, "
                 f"{len(parsed.get('nodes', []))} node(s), "
                 f"{len(parsed.get('edges', []))} edge(s)"
             )
             return parsed
         except json.JSONDecodeError as e:
             log.warning(f"[LLM] JSON parse failed: {e}")
-            return {"action": "extend", "diagram_type": "none", "nodes": [], "edges": [], "_raw_response": raw}
+            return {
+                "action": "extend",
+                "diagram_id": "",
+                "diagram_type": "none",
+                "nodes": [],
+                "edges": [],
+                "_raw_response": raw,
+            }

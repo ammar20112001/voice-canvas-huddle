@@ -1,46 +1,99 @@
 import { getArrowBindings, renderPlaintextFromRichText } from 'tldraw'
+import { getDiagramState } from './diagramRender'
 
 // Watches the canvas for manual edits (drag, rename, delete, a shape drawn
-// by hand) and streams the resulting diagram back to the backend over the
-// same WebSocket used for audio, as a JSON text message - so Jarvis's next
-// LLM call reflects what's actually on screen instead of drifting from it.
+// by hand) and streams the resulting diagram set back to the backend over
+// the same WebSocket used for audio, as a JSON text message - so Jarvis's
+// next LLM call reflects what's actually on screen instead of drifting
+// from it.
 //
 // Only fires for source: 'user' changes. diagramRender.js wraps every
 // AI-driven mutation in editor.store.mergeRemoteChanges(), which tags them
 // source: 'remote', so Jarvis's own draws never get picked up here and
 // echoed straight back as if they were a manual edit.
 const SYNC_DEBOUNCE_MS = 600
+const MANUAL_DIAGRAM_ID = 'manual'
 
-function serializeDiagram(editor, state) {
+function nearestDiagramId(shape, state) {
+  const entries = Object.entries(state.regionOffsets)
+  if (!entries.length) return null
+  let bestId = null
+  let bestDist = Infinity
+  for (const [diagramId, offsetX] of entries) {
+    const regionWidth = state.diagrams[diagramId]?.width || 0
+    const regionCenter = offsetX + regionWidth / 2
+    const dist = Math.abs(shape.x - regionCenter)
+    if (dist < bestDist) {
+      bestDist = dist
+      bestId = diagramId
+    }
+  }
+  return bestId
+}
+
+// A shape the user drew by hand has no diagram association yet - group it
+// with whichever existing diagram's region it's closest to (probably drawn
+// near/inside that cluster), or a shared catch-all "Manual edits" diagram
+// if the canvas has none yet.
+function diagramIdForShape(shape, state) {
+  const known = state.shapeToDiagram[shape.id]
+  if (known) return known
+  const diagramId = nearestDiagramId(shape, state) ?? MANUAL_DIAGRAM_ID
+  state.shapeToDiagram[shape.id] = diagramId
+  return diagramId
+}
+
+function serializeDiagrams(editor, state) {
   const shapes = editor.getCurrentPageShapes()
-  const nodes = []
-  const edges = []
+  const buckets = {} // diagramId -> {id, title, diagram_type, nodes, edges}
+
+  function bucketFor(diagramId) {
+    if (!buckets[diagramId]) {
+      const dState = getDiagramState(state, diagramId)
+      buckets[diagramId] = {
+        id: diagramId,
+        title: dState.title ?? 'Manual edits',
+        diagram_type: dState.diagramType ?? 'flow',
+        nodes: [],
+        edges: [],
+      }
+    }
+    return buckets[diagramId]
+  }
 
   for (const shape of shapes) {
     if (shape.type !== 'geo') continue
-    let nodeId = state.schemaIds[shape.id]
+    const diagramId = diagramIdForShape(shape, state)
+    const dState = getDiagramState(state, diagramId)
+
+    let nodeId = dState.schemaIds[shape.id]
     if (!nodeId) {
-      // A shape the user created by hand - Jarvis has never seen it, so
-      // mint an id and register it both ways for stable future edits.
       nodeId = `user_${shape.id.replace('shape:', '')}`
-      state.schemaIds[shape.id] = nodeId
-      state.shapeIds[nodeId] = shape.id
+      dState.schemaIds[shape.id] = nodeId
+      dState.shapeIds[nodeId] = shape.id
     }
-    nodes.push({ id: nodeId, label: renderPlaintextFromRichText(editor, shape.props.richText) })
+    bucketFor(diagramId).nodes.push({ id: nodeId, label: renderPlaintextFromRichText(editor, shape.props.richText) })
   }
 
   for (const shape of shapes) {
     if (shape.type !== 'arrow') continue
     const bindings = getArrowBindings(editor, shape)
-    const fromId = bindings.start && state.schemaIds[bindings.start.toId]
-    const toId = bindings.end && state.schemaIds[bindings.end.toId]
-    if (!fromId || !toId) continue // unbound arrow - no clear from/to, skip
+    if (!bindings.start || !bindings.end) continue // unbound arrow - no clear from/to, skip
+
+    // Both bound shapes were already visited in the geo loop above (Jarvis
+    // never draws cross-diagram edges, so they're expected to agree on
+    // which diagram) - attribute the edge to the start shape's diagram.
+    const diagramId = state.shapeToDiagram[bindings.start.toId] ?? MANUAL_DIAGRAM_ID
+    const dState = getDiagramState(state, diagramId)
+    const fromId = dState.schemaIds[bindings.start.toId]
+    const toId = dState.schemaIds[bindings.end.toId]
+    if (!fromId || !toId) continue
 
     const label = renderPlaintextFromRichText(editor, shape.props.richText)
-    edges.push(label ? { from: fromId, to: toId, label } : { from: fromId, to: toId })
+    bucketFor(diagramId).edges.push(label ? { from: fromId, to: toId, label } : { from: fromId, to: toId })
   }
 
-  return { nodes, edges }
+  return Object.values(buckets)
 }
 
 // Returns a cleanup function - call it when the WebSocket this was set up
@@ -53,7 +106,7 @@ export function watchForManualEdits(editor, ws, state) {
       clearTimeout(debounceTimer)
       debounceTimer = setTimeout(() => {
         if (ws.readyState !== WebSocket.OPEN) return
-        ws.send(JSON.stringify(serializeDiagram(editor, state)))
+        ws.send(JSON.stringify({ type: 'diagram_edit', diagrams: serializeDiagrams(editor, state) }))
       }, SYNC_DEBOUNCE_MS)
     },
     { source: 'user', scope: 'document' }

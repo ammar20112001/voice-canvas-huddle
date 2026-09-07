@@ -1,8 +1,10 @@
 import { createShapeId, toRichText } from 'tldraw'
-import { layoutSchema } from './diagramLayout'
+import { layoutDiagram } from './diagramLayout'
 
 const NODE_STAGGER_MS = 150
 const EDGE_STAGGER_MS = 100
+const DIAGRAM_GUTTER = 200 // horizontal gap between separate diagrams' regions
+const TITLE_HEIGHT = 40
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms))
@@ -12,68 +14,111 @@ function edgeKey(edge) {
   return `${edge.from}->${edge.to}`
 }
 
-// Tracks what's already been drawn for one canvas across repeated
-// renderSchema() calls, so a later "extend" schema only adds what's new
-// instead of redrawing everything. Create one per canvas/session.
-//
-// schemaIds is the reverse of shapeIds (tldraw shape id -> schema node id) -
-// diagramSync.js needs it to report manual edits back using the same node
-// ids Jarvis already knows, instead of tldraw's internal shape ids.
+// Tracks what's already been drawn across repeated renderSchema() calls, so
+// a later message only adds what's new instead of redrawing everything.
+// Per-diagram state lives under `diagrams[diagramId]` since node ids are
+// only unique within their own diagram (two different diagrams can both
+// have a node called "start"). `shapeToDiagram` is the one thing that
+// isn't per-diagram - diagramSync.js needs a flat shape -> diagram lookup
+// to know which diagram a shape it's serializing belongs to. Create one per
+// canvas/session.
 export function createRenderState() {
-  return { shapeIds: {}, schemaIds: {}, drawnEdgeKeys: new Set() }
+  return { diagrams: {}, regionOffsets: {}, order: [], shapeToDiagram: {} }
 }
 
-// Renders a {action, diagram_type, nodes, edges} schema onto the tldraw
-// canvas. `schema` is always the FULL diagram as understood so far (the
-// backend merges extend/new itself) - this function diffs against `state`
-// to figure out what's actually new, and only creates those shapes, one at
-// a time, so the diagram visibly draws itself instead of popping in all at
-// once. On action "new" the canvas (and state) is cleared first.
-//
-// Every mutation here runs inside editor.store.mergeRemoteChanges() so it's
-// tagged source: 'remote' - diagramSync.js listens for source: 'user' only,
-// so Jarvis's own draws never get mistaken for (and echoed back as) a
-// manual edit.
-export async function renderSchema(editor, schema, state) {
-  if (!schema) return
-
-  if (schema.action === 'new') {
-    const existingIds = Array.from(editor.getCurrentPageShapeIds())
-    if (existingIds.length) {
-      editor.store.mergeRemoteChanges(() => {
-        editor.deleteShapes(existingIds)
-      })
+// Exported so diagramSync.js can read/create the same per-diagram bucket
+// when reporting a manual edit back - one shape, not two drifting copies.
+export function getDiagramState(state, diagramId) {
+  if (!state.diagrams[diagramId]) {
+    state.diagrams[diagramId] = {
+      shapeIds: {},
+      schemaIds: {},
+      drawnEdgeKeys: new Set(),
+      titleShapeId: null,
+      width: 0,
+      title: null,
+      diagramType: null,
     }
-    state.shapeIds = {}
-    state.schemaIds = {}
-    state.drawnEdgeKeys = new Set()
+  }
+  return state.diagrams[diagramId]
+}
+
+// Assigns each diagram a horizontal region on the shared canvas so separate
+// diagrams never overlap. A region's offset is fixed the first time a
+// diagram is drawn and never moves afterward - if a diagram later grows
+// wider than the gutter reserved for it, it can visually overlap its
+// neighbor. Acceptable for a prototype; a stable re-flowing layout is
+// future work.
+function assignRegion(state, diagramId, width) {
+  const dState = getDiagramState(state, diagramId)
+  if (state.regionOffsets[diagramId] === undefined) {
+    const usedRight = state.order.reduce((max, id) => {
+      const w = state.diagrams[id]?.width || 0
+      return Math.max(max, state.regionOffsets[id] + w)
+    }, 0)
+    state.regionOffsets[diagramId] = state.order.length ? usedRight + DIAGRAM_GUTTER : 0
+    state.order.push(diagramId)
+  }
+  dState.width = Math.max(dState.width, width)
+  return state.regionOffsets[diagramId]
+}
+
+function clearCanvas(editor, state) {
+  const existingIds = Array.from(editor.getCurrentPageShapeIds())
+  if (existingIds.length) {
+    editor.store.mergeRemoteChanges(() => {
+      editor.deleteShapes(existingIds)
+    })
+  }
+  state.diagrams = {}
+  state.regionOffsets = {}
+  state.order = []
+  state.shapeToDiagram = {}
+}
+
+// Draws one diagram's not-yet-drawn nodes/edges into its assigned region,
+// one shape at a time so it visibly draws itself instead of popping in all
+// at once. Every mutation runs inside editor.store.mergeRemoteChanges() so
+// it's tagged source: 'remote' - diagramSync.js listens for source: 'user'
+// only, so Jarvis's own draws never get mistaken for (and echoed back as) a
+// manual edit.
+async function drawDiagram(editor, diagram, state) {
+  if (!diagram.nodes?.length) return
+
+  const dState = getDiagramState(state, diagram.id)
+  dState.title = diagram.title ?? dState.title
+  dState.diagramType = diagram.diagram_type ?? dState.diagramType
+  const { boxes, width } = layoutDiagram(diagram)
+  const offsetX = assignRegion(state, diagram.id, width)
+
+  if (dState.titleShapeId === null && diagram.title) {
+    const titleId = createShapeId()
+    dState.titleShapeId = titleId
+    editor.store.mergeRemoteChanges(() => {
+      editor.createShape({
+        id: titleId,
+        type: 'text',
+        x: offsetX,
+        y: -TITLE_HEIGHT,
+        props: { richText: toRichText(diagram.title), w: Math.max(width, 160), autoSize: false },
+      })
+    })
   }
 
-  if (schema.diagram_type === 'none' || !schema.nodes?.length) {
-    return
-  }
-
-  // Laying out the full graph on every call (not just the new nodes) keeps
-  // new nodes positioned sensibly relative to old ones, at the cost of
-  // recomputing positions for nodes that are already drawn - those aren't
-  // moved, so as the diagram grows a later layout pass can drift from
-  // where earlier nodes actually ended up. Fine for a prototype; a stable
-  // incremental layout is future work.
-  const boxes = layoutSchema(schema)
-
-  for (const node of schema.nodes) {
-    if (state.shapeIds[node.id]) continue // already drawn
+  for (const node of diagram.nodes) {
+    if (dState.shapeIds[node.id]) continue // already drawn
 
     const id = createShapeId()
-    state.shapeIds[node.id] = id
-    state.schemaIds[id] = node.id
+    dState.shapeIds[node.id] = id
+    dState.schemaIds[id] = node.id
+    state.shapeToDiagram[id] = diagram.id
     const box = boxes[node.id]
 
     editor.store.mergeRemoteChanges(() => {
       editor.createShape({
         id,
         type: 'geo',
-        x: box.x,
+        x: offsetX + box.x,
         y: box.y,
         props: {
           geo: 'rectangle',
@@ -86,14 +131,14 @@ export async function renderSchema(editor, schema, state) {
     await sleep(NODE_STAGGER_MS)
   }
 
-  for (const edge of schema.edges) {
+  for (const edge of diagram.edges ?? []) {
     const key = edgeKey(edge)
-    if (state.drawnEdgeKeys.has(key)) continue
+    if (dState.drawnEdgeKeys.has(key)) continue
 
-    const fromShapeId = state.shapeIds[edge.from]
-    const toShapeId = state.shapeIds[edge.to]
+    const fromShapeId = dState.shapeIds[edge.from]
+    const toShapeId = dState.shapeIds[edge.to]
     if (!fromShapeId || !toShapeId) continue
-    state.drawnEdgeKeys.add(key)
+    dState.drawnEdgeKeys.add(key)
 
     const arrowId = createShapeId()
     const fromBox = boxes[edge.from]
@@ -108,8 +153,8 @@ export async function renderSchema(editor, schema, state) {
         props: {
           // Initial points in case binding resolution ever fails - normally
           // overridden visually once the bindings below attach.
-          start: { x: fromBox.x + fromBox.w / 2, y: fromBox.y + fromBox.h / 2 },
-          end: { x: toBox.x + toBox.w / 2, y: toBox.y + toBox.h / 2 },
+          start: { x: offsetX + fromBox.x + fromBox.w / 2, y: fromBox.y + fromBox.h / 2 },
+          end: { x: offsetX + toBox.x + toBox.w / 2, y: toBox.y + toBox.h / 2 },
           richText: toRichText(edge.label ?? ''),
         },
       })
@@ -134,6 +179,31 @@ export async function renderSchema(editor, schema, state) {
 
     await sleep(EDGE_STAGGER_MS)
   }
+}
 
-  editor.zoomToFit({ animation: { duration: 300 } })
+// Renders a server message onto the tldraw canvas:
+//   {action: "extend", diagram} - draws only what's new into that diagram's
+//     existing region; every other diagram is left untouched.
+//   {action: "new_diagram", diagram} - assigns a fresh region and draws the
+//     whole diagram there; every other diagram is left untouched.
+//   {action: "replace_all", diagrams} - clears the canvas and (re)draws every
+//     diagram fresh. Used for an explicit clear-and-restart, an undo, and
+//     the resume-on-reconnect push - the frontend treats all three the same
+//     way.
+export async function renderSchema(editor, message, state) {
+  if (!message) return
+
+  if (message.action === 'replace_all') {
+    clearCanvas(editor, state)
+    for (const diagram of message.diagrams ?? []) {
+      await drawDiagram(editor, diagram, state)
+    }
+    editor.zoomToFit({ animation: { duration: 300 } })
+    return
+  }
+
+  if ((message.action === 'extend' || message.action === 'new_diagram') && message.diagram) {
+    await drawDiagram(editor, message.diagram, state)
+    editor.zoomToFit({ animation: { duration: 300 } })
+  }
 }
