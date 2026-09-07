@@ -1,7 +1,14 @@
 """
-WebSocket bridge between a browser mic and the voice -> diagram-schema pipeline.
+WebSocket bridge between a browser mic/canvas and the voice -> diagram-schema
+pipeline. Both message types below share the one connection - the browser
+tells binary from text apart by frame type, same as this file does.
 
   browser -> server:  binary WS frames, raw PCM16 audio (16kHz mono, any chunk size)
+  browser -> server:  JSON text WS frames, {nodes, edges} - the diagram as it
+                       stands after a manual edit on the canvas (drag,
+                       rename, delete, a shape drawn by hand). Replaces
+                       current_diagram outright so Jarvis's next call
+                       reflects what's actually on screen.
   server -> browser:  JSON text WS frames, {action, diagram_type, nodes, edges} -
                        the full diagram as understood so far this connection,
                        plus whether the latest utterance extended it or
@@ -25,6 +32,7 @@ Run:
 """
 
 import asyncio
+import json
 import logging
 import os
 import sys
@@ -109,6 +117,30 @@ def _merge_diagram(current: dict, schema: dict) -> dict:
     return {"diagram_type": diagram_type, "nodes": merged_nodes, "edges": merged_edges}
 
 
+def _apply_diagram_edit(raw_text: str) -> None:
+    """Adopts a diagram snapshot the frontend sends after a manual canvas
+    edit - replaces _session.current_diagram outright (not merged, unlike
+    _merge_diagram's "extend": the frontend already reports the full
+    current shape set, deletions included, so a merge would resurrect
+    anything the user just deleted) so Jarvis's next call reflects what's
+    actually on screen instead of drifting from it."""
+    try:
+        payload = json.loads(raw_text)
+    except json.JSONDecodeError:
+        log.warning(f"[WS] malformed diagram edit payload, ignoring: {raw_text!r}")
+        return
+
+    _session.current_diagram = {
+        "diagram_type": payload.get("diagram_type", _session.current_diagram["diagram_type"]),
+        "nodes": payload.get("nodes", []),
+        "edges": payload.get("edges", []),
+    }
+    log.info(
+        f"[WS] adopted manually edited diagram - {len(_session.current_diagram['nodes'])} "
+        f"node(s), {len(_session.current_diagram['edges'])} edge(s)"
+    )
+
+
 @app.websocket("/ws/audio")
 async def audio_socket(ws: WebSocket):
     await ws.accept()
@@ -141,7 +173,18 @@ async def audio_socket(ws: WebSocket):
 
     try:
         while True:
-            chunk = await ws.receive_bytes()
+            message = await ws.receive()
+            if message["type"] == "websocket.disconnect":
+                raise WebSocketDisconnect(message.get("code", 1000))
+
+            if message.get("text") is not None:
+                _apply_diagram_edit(message["text"])
+                continue
+
+            chunk = message.get("bytes")
+            if chunk is None:
+                continue  # no payload on this frame - nothing to do
+
             # Nothing below this point should ever be allowed to kill the
             # connection - a bad audio chunk, a Whisper hiccup, or a flaky
             # Anthropic call should be logged and skipped, not drop the

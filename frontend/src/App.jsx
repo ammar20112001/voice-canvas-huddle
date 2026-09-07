@@ -4,6 +4,7 @@ import 'tldraw/tldraw.css'
 import './App.css'
 import { startAudioCapture } from './lib/audioCapture'
 import { createRenderState, renderSchema } from './lib/diagramRender'
+import { watchForManualEdits } from './lib/diagramSync'
 
 const WS_URL = import.meta.env.VITE_WS_URL || 'ws://localhost:8000/ws/audio'
 
@@ -11,6 +12,13 @@ export default function App() {
   const editorRef = useRef(null)
   const wsRef = useRef(null)
   const stopCaptureRef = useRef(null)
+  const stopSyncRef = useRef(null)
+  // Persists across reconnects rather than resetting in start() - the
+  // backend now keeps its diagram across a drop too (see backend/server.py's
+  // _SessionState) and pushes it back immediately on reconnect, at which
+  // point renderSchema's "new" handling resets this anyway. Not resetting
+  // here means the id mapping stays valid if a reconnect happens without a
+  // full page reload (the canvas never actually went away).
   const renderStateRef = useRef(createRenderState())
   const [status, setStatus] = useState('idle') // idle | connecting | listening | error
 
@@ -19,6 +27,8 @@ export default function App() {
   }, [])
 
   const stop = useCallback(() => {
+    stopSyncRef.current?.()
+    stopSyncRef.current = null
     stopCaptureRef.current?.()
     stopCaptureRef.current = null
     wsRef.current?.close()
@@ -28,10 +38,6 @@ export default function App() {
 
   const start = useCallback(async () => {
     setStatus('connecting')
-    // Each session gets its own backend-tracked diagram state (see
-    // backend/server.py), so the frontend's picture of "what's already
-    // drawn" needs to reset alongside it.
-    renderStateRef.current = createRenderState()
     const ws = new WebSocket(WS_URL)
     ws.binaryType = 'arraybuffer'
     wsRef.current = ws
@@ -39,6 +45,9 @@ export default function App() {
     ws.onopen = async () => {
       try {
         stopCaptureRef.current = await startAudioCapture(ws)
+        if (editorRef.current) {
+          stopSyncRef.current = watchForManualEdits(editorRef.current, ws, renderStateRef.current)
+        }
         setStatus('listening')
       } catch (err) {
         console.error('[app] mic capture failed', err)
@@ -60,6 +69,8 @@ export default function App() {
     }
 
     ws.onclose = () => {
+      stopSyncRef.current?.()
+      stopSyncRef.current = null
       stopCaptureRef.current?.()
       stopCaptureRef.current = null
       setStatus('idle')
