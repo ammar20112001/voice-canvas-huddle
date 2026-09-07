@@ -32,6 +32,7 @@ from backend.pipeline import (
     DiagramAgent,
     Segmenter,
     Transcriber,
+    build_background_context,
     is_sleep_phrase,
     is_wake_phrase,
 )
@@ -108,67 +109,91 @@ async def audio_socket(ws: WebSocket):
     # regex completeness heuristic.
     active = False
     transcript_log = []
+    # Index into transcript_log recorded right after each draw that actually
+    # changed current_diagram - lets build_background_context() show the LLM
+    # exactly how far the transcript had gotten each time the diagram was
+    # last updated, instead of one undifferentiated blob of prior speech.
+    draw_marker_indices = []
 
     try:
         while True:
             chunk = await ws.receive_bytes()
-            for pcm16_bytes, duration_s in segmenter.feed(chunk):
-                pipeline_t0 = time.perf_counter()
+            # Nothing below this point should ever be allowed to kill the
+            # connection - a bad audio chunk, a Whisper hiccup, or a flaky
+            # Anthropic call should be logged and skipped, not drop the
+            # socket. Only an actual client disconnect (or task
+            # cancellation, e.g. server shutdown) should end the loop.
+            try:
+                utterances = segmenter.feed(chunk)
+            except Exception:
+                log.exception("[VAD] error segmenting audio chunk - continuing")
+                continue
 
-                # faster-whisper and the Anthropic client are both blocking
-                # calls - run them off the event loop so other connections
-                # (and this one's audio receive loop) aren't stalled.
-                text = await asyncio.to_thread(_transcriber.transcribe, pcm16_bytes, duration_s)
-                if not text:
-                    log.info("[PIPE] empty transcription, discarding utterance")
-                    continue
+            for pcm16_bytes, duration_s in utterances:
+                try:
+                    pipeline_t0 = time.perf_counter()
 
-                if is_wake_phrase(text):
-                    transcript_log.append(text)
+                    # faster-whisper and the Anthropic client are both
+                    # blocking calls - run them off the event loop so other
+                    # connections (and this one's audio receive loop) aren't
+                    # stalled.
+                    text = await asyncio.to_thread(_transcriber.transcribe, pcm16_bytes, duration_s)
+                    if not text:
+                        log.info("[PIPE] empty transcription, discarding utterance")
+                        continue
+
+                    if is_wake_phrase(text):
+                        transcript_log.append(text)
+                        if not active:
+                            active = True
+                            log.info(f"[JARVIS] wake phrase in \"{text}\" - now active")
+                        continue
+
+                    if is_sleep_phrase(text):
+                        transcript_log.append(text)
+                        if active:
+                            active = False
+                            log.info(f"[JARVIS] sleep phrase in \"{text}\" - now inactive")
+                        continue
+
                     if not active:
-                        active = True
-                        log.info(f"[JARVIS] wake phrase in \"{text}\" - now active")
-                    continue
+                        transcript_log.append(text)
+                        log.info(f"[JARVIS] inactive, logged as background context: \"{text}\"")
+                        continue
 
-                if is_sleep_phrase(text):
+                    background_context = build_background_context(transcript_log, draw_marker_indices)
                     transcript_log.append(text)
-                    if active:
-                        active = False
-                        log.info(f"[JARVIS] sleep phrase in \"{text}\" - now inactive")
+                    schema = await asyncio.to_thread(_agent.generate, text, current_diagram, background_context)
+                    prev_node_count = len(current_diagram["nodes"])
+                    prev_edge_count = len(current_diagram["edges"])
+                    current_diagram = _merge_diagram(current_diagram, schema)
+                    total = time.perf_counter() - pipeline_t0
+                    log.info(
+                        f"[PIPE] total time from utterance end to schema ready: {total:.2f}s, "
+                        f"diagram now has {len(current_diagram['nodes'])} node(s), "
+                        f"{len(current_diagram['edges'])} edge(s)"
+                    )
+
+                    # Not every complete-sounding fragment is drawable (small
+                    # talk, background context) - when the model added
+                    # nothing and didn't start a new diagram, there's
+                    # nothing for the frontend to do, so don't make it
+                    # redraw/re-zoom for no reason.
+                    changed = (
+                        schema.get("action") == "new"
+                        or len(current_diagram["nodes"]) != prev_node_count
+                        or len(current_diagram["edges"]) != prev_edge_count
+                    )
+                    if not changed:
+                        log.info("[PIPE] no drawable change, keeping diagram as is")
+                        continue
+
+                    draw_marker_indices.append(len(transcript_log))
+                    await ws.send_json({"action": schema.get("action", "new"), **current_diagram})
+                except (WebSocketDisconnect, asyncio.CancelledError):
+                    raise
+                except Exception:
+                    log.exception("[PIPE] error processing utterance - continuing")
                     continue
-
-                if not active:
-                    transcript_log.append(text)
-                    log.info(f"[JARVIS] inactive, logged as background context: \"{text}\"")
-                    continue
-
-                background_context = "\n".join(transcript_log)
-                transcript_log.append(text)
-                schema = await asyncio.to_thread(_agent.generate, text, current_diagram, background_context)
-                prev_node_count = len(current_diagram["nodes"])
-                prev_edge_count = len(current_diagram["edges"])
-                current_diagram = _merge_diagram(current_diagram, schema)
-                total = time.perf_counter() - pipeline_t0
-                log.info(
-                    f"[PIPE] total time from utterance end to schema ready: {total:.2f}s, "
-                    f"diagram now has {len(current_diagram['nodes'])} node(s), "
-                    f"{len(current_diagram['edges'])} edge(s)"
-                )
-
-                # Not every complete-sounding fragment is drawable (small
-                # talk, background context) - when the model added nothing
-                # and didn't start a new diagram, there's nothing for the
-                # frontend to do, so don't make it redraw/re-zoom for no
-                # reason.
-                changed = (
-                    schema.get("action") == "new"
-                    or len(current_diagram["nodes"]) != prev_node_count
-                    or len(current_diagram["edges"]) != prev_edge_count
-                )
-                if not changed:
-                    log.info("[PIPE] no drawable change, keeping diagram as is")
-                    continue
-
-                await ws.send_json({"action": schema.get("action", "new"), **current_diagram})
     except WebSocketDisconnect:
         log.info("[WS] client disconnected")

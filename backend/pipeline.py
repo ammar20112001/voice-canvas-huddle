@@ -37,11 +37,6 @@ STREAM_FLUSH_MS = 5000             # during continuous speech (no pause), flush 
 WHISPER_MODEL_SIZE = "base.en"     # try "tiny.en" first if base.en feels slow on your CPU
 LLM_MODEL = "claude-haiku-4-5-20251001"
 
-TRAILING_FILLER_WORDS = {
-    "and", "with", "or", "the", "a", "an", "to", "of", "in", "on", "for",
-    "so", "that", "which", "but", "then", "into", "like", "as", "is", "are",
-}
-
 # Wake word for voice control of drawing - see is_wake_phrase()/is_sleep_phrase().
 WAKE_WORD = "jarvis"
 WAKE_WORD_SIMILARITY = 0.7          # difflib ratio threshold for a fuzzy "jarvis" match
@@ -53,10 +48,16 @@ SYSTEM_PROMPT = """You maintain a structured diagram across a series of spoken i
 Each message gives you JSON with three fields:
   "current_diagram": the diagram as drawn so far - {diagram_type, nodes, edges}
     (empty if nothing has been drawn yet).
-  "background_context": earlier conversation not yet reflected in the
-    diagram - things said before drawing was turned on, or between
-    instructions - that may explain what's being built or why (empty if
-    there's none).
+  "background_context": the transcript of everything said before this
+    instruction, interleaved with checkpoint markers reading
+    "[[diagram updated up to this point]]". Each marker shows exactly how
+    far into the transcript things stood the moment current_diagram last
+    changed. Text before the LAST marker (or the whole thing, if there's
+    no marker yet) is already reflected in current_diagram - read it only
+    for situational understanding, don't treat it as new material to draw.
+    Text after the last marker hasn't produced any diagram change yet and
+    may be directly relevant to this instruction (empty if there's no
+    context at all).
   "instruction": the newest spoken instruction to incorporate.
 
 First decide: does this instruction continue the current diagram (add detail,
@@ -218,18 +219,30 @@ def is_sleep_phrase(text: str) -> bool:
     return bool(SLEEP_PHRASE_RE.search(text)) and _mentions_wake_word(text)
 
 
-# ---------------- Completeness heuristic ----------------
-def looks_complete(text: str) -> tuple[bool, str]:
-    """Returns (is_complete, reason) so the caller can log *why*."""
-    if not text:
-        return False, "empty transcript"
-    word_count = len(text.split())
-    if word_count < 3:
-        return False, f"too short ({word_count} word(s))"
-    last_word = re.sub(r"[^\w']", "", text.split()[-1]).lower()
-    if last_word in TRAILING_FILLER_WORDS:
-        return False, f"ends on filler word '{last_word}'"
-    return True, f"ends on '{last_word}', {word_count} words total"
+# ---------------- Background context assembly ----------------
+DRAW_CHECKPOINT_MARKER = "[[diagram updated up to this point]]"
+
+
+def build_background_context(transcript_log: list[str], draw_marker_indices: list[int]) -> str:
+    """Interleaves the transcript with DRAW_CHECKPOINT_MARKER at each
+    recorded checkpoint, so the LLM can tell which part of the transcript
+    already produced the current diagram from what's new since the last
+    draw - see SYSTEM_PROMPT's description of "background_context".
+
+    draw_marker_indices holds, for each successful draw, how many
+    transcript_log entries existed at that moment (the caller records one
+    via len(transcript_log) right after any draw that actually changes the
+    diagram) - e.g. 3 means "the first 3 lines were available when that
+    draw happened," so the marker renders right after line index 2.
+    """
+    lines = []
+    marker_i = 0
+    for i, text in enumerate(transcript_log):
+        lines.append(text)
+        while marker_i < len(draw_marker_indices) and draw_marker_indices[marker_i] == i + 1:
+            lines.append(DRAW_CHECKPOINT_MARKER)
+            marker_i += 1
+    return "\n".join(lines)
 
 
 # ---------------- Schema generation ----------------
