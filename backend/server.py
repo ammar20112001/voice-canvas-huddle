@@ -34,7 +34,6 @@ from backend.pipeline import (
     Transcriber,
     is_sleep_phrase,
     is_wake_phrase,
-    looks_complete,
 )
 
 load_dotenv()
@@ -93,18 +92,22 @@ async def audio_socket(ws: WebSocket):
     log.info("[WS] client connected")
 
     segmenter = Segmenter()
-    pending_text = ""
     # Full diagram state as understood so far this connection - handed back
     # to the LLM each turn so it can decide whether to extend or replace it.
     current_diagram = {"diagram_type": "none", "nodes": [], "edges": []}
     # Jarvis only draws between a wake phrase ("Start drawing Jarvis") and a
     # sleep phrase ("Stop building Jarvis") - see backend/pipeline.py's
     # is_wake_phrase()/is_sleep_phrase(). Everything transcribed outside
-    # that window (or while a multi-chunk instruction is still assembling)
-    # is kept as background_context instead of being drawn.
+    # that window is kept as background_context instead of being drawn.
+    # While active, every transcribed chunk (roughly every 5s during
+    # continuous speech - see Segmenter's STREAM_FLUSH_MS - or sooner on a
+    # natural pause) goes straight to the LLM; there's no local "is this a
+    # complete sentence" gate holding it back. The model itself decides
+    # per-turn whether a fragment is drawable yet (falling back to a no-op
+    # extend when it isn't), which is both faster and more accurate than a
+    # regex completeness heuristic.
     active = False
     transcript_log = []
-    pending_start_idx = 0  # index into transcript_log where the current pending_text began
 
     try:
         while True:
@@ -124,7 +127,6 @@ async def audio_socket(ws: WebSocket):
                     transcript_log.append(text)
                     if not active:
                         active = True
-                        pending_text = ""
                         log.info(f"[JARVIS] wake phrase in \"{text}\" - now active")
                     continue
 
@@ -132,7 +134,6 @@ async def audio_socket(ws: WebSocket):
                     transcript_log.append(text)
                     if active:
                         active = False
-                        pending_text = ""
                         log.info(f"[JARVIS] sleep phrase in \"{text}\" - now inactive")
                     continue
 
@@ -141,25 +142,9 @@ async def audio_socket(ws: WebSocket):
                     log.info(f"[JARVIS] inactive, logged as background context: \"{text}\"")
                     continue
 
-                if not pending_text:
-                    pending_start_idx = len(transcript_log)
+                background_context = "\n".join(transcript_log)
                 transcript_log.append(text)
-
-                combined = (pending_text + " " + text).strip() if pending_text else text
-                if pending_text:
-                    log.info(f"[PIPE] merged with pending text -> \"{combined}\"")
-
-                complete, reason = looks_complete(combined)
-                log.info(f"[CHECK] complete={complete} ({reason})")
-
-                if not complete:
-                    pending_text = combined
-                    log.info("[PIPE] holding as pending, waiting for more speech")
-                    continue
-
-                pending_text = ""
-                background_context = "\n".join(transcript_log[:pending_start_idx])
-                schema = await asyncio.to_thread(_agent.generate, combined, current_diagram, background_context)
+                schema = await asyncio.to_thread(_agent.generate, text, current_diagram, background_context)
                 prev_node_count = len(current_diagram["nodes"])
                 prev_edge_count = len(current_diagram["edges"])
                 current_diagram = _merge_diagram(current_diagram, schema)
