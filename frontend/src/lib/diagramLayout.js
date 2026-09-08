@@ -63,5 +63,18 @@ export function layoutDiagram(diagram) {
     width = Math.max(width, box.x + box.w)
     height = Math.max(height, box.y + box.h)
   }
-  return { boxes, width, height }
+
+  // dagre's own routing already reasons about the whole graph when it
+  // decides where each edge should bend to avoid other nodes - throwing
+  // this away and asking tldraw to route each edge from just its two
+  // endpoints (with no idea what else is on the canvas) is what caused
+  // edges to cut straight through unrelated boxes in dense diagrams. See
+  // diagramRender.js for how these points get drawn.
+  const edgePaths = {}
+  for (const edge of diagram.edges) {
+    const key = `${edge.from}->${edge.to}`
+    edgePaths[key] = g.edge(edge.from, edge.to).points.map((p) => ({ x: p.x, y: p.y }))
+  }
+
+  return { boxes, width, height, edgePaths }
 }

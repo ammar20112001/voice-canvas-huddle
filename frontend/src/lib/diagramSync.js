@@ -78,16 +78,23 @@ function serializeDiagrams(editor, state) {
   for (const shape of shapes) {
     if (shape.type !== 'arrow') continue
     const bindings = getArrowBindings(editor, shape)
-    if (!bindings.start || !bindings.end) continue // unbound arrow - no clear from/to, skip
+    if (!bindings.end) continue // no bound target - no clear "to", skip
 
     // Both bound shapes were already visited in the geo loop above (Jarvis
     // never draws cross-diagram edges, so they're expected to agree on
-    // which diagram) - attribute the edge to the start shape's diagram.
-    const diagramId = state.shapeToDiagram[bindings.start.toId] ?? MANUAL_DIAGRAM_ID
+    // which diagram) - attribute the edge to the target shape's diagram.
+    const diagramId = state.shapeToDiagram[bindings.end.toId] ?? MANUAL_DIAGRAM_ID
     const dState = getDiagramState(state, diagramId)
-    const fromId = dState.schemaIds[bindings.start.toId]
     const toId = dState.schemaIds[bindings.end.toId]
-    if (!fromId || !toId) continue
+    if (!toId) continue
+
+    // A normal edge the user hand-drew with tldraw's own arrow tool has
+    // both ends bound - read "from" the same way as "to". An AI-routed
+    // edge's final-hop arrow (see diagramRender.js's drawRoutedEdge) is
+    // deliberately bound at its end only, so its start binding won't
+    // exist - its true source is recorded separately at draw time.
+    const fromId = bindings.start ? dState.schemaIds[bindings.start.toId] : dState.edgeSourceNode[shape.id]
+    if (!fromId) continue
 
     const label = renderPlaintextFromRichText(editor, shape.props.richText)
     bucketFor(diagramId).edges.push(label ? { from: fromId, to: toId, label } : { from: fromId, to: toId })

@@ -10,6 +10,7 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "@tldraw/utils": "^5.4.0",
     "dagre": "^0.8.5",
     "react": "^19.2.8",
     "react-dom": "^19.2.8",

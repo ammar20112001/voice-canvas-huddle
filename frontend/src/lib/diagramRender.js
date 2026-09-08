@@ -1,4 +1,5 @@
 import { createShapeId, renderPlaintextFromRichText, toRichText } from 'tldraw'
+import { getIndices } from '@tldraw/utils'
 import { layoutDiagram } from './diagramLayout'
 
 const NODE_STAGGER_MS = 150
@@ -35,6 +36,8 @@ export function getDiagramState(state, diagramId) {
       shapeIds: {},
       schemaIds: {},
       drawnEdgeKeys: new Set(),
+      edgeShapeIds: {}, // edgeKey -> shape id(s) drawn for it, so a later layout pass can redraw it fresh
+      edgeSourceNode: {}, // arrow shape id -> schema node id of its TRUE source, for edges whose start isn't bound (see drawEdge)
       titleShapeId: null,
       width: 0,
       title: null,
@@ -90,7 +93,7 @@ async function drawDiagram(editor, diagram, state) {
   const dState = getDiagramState(state, diagram.id)
   dState.title = diagram.title ?? dState.title
   dState.diagramType = diagram.diagram_type ?? dState.diagramType
-  const { boxes, width } = layoutDiagram(diagram)
+  const { boxes, width, edgePaths } = layoutDiagram(diagram)
   const offsetX = assignRegion(state, diagram.id, width)
 
   if (dState.titleShapeId === null && diagram.title) {
@@ -165,61 +168,112 @@ async function drawDiagram(editor, diagram, state) {
 
   for (const edge of diagram.edges ?? []) {
     const key = edgeKey(edge)
-    if (dState.drawnEdgeKeys.has(key)) continue
-
     const fromShapeId = dState.shapeIds[edge.from]
     const toShapeId = dState.shapeIds[edge.to]
     if (!fromShapeId || !toShapeId) continue
+
+    const rawPoints = edgePaths[key]
+    if (!rawPoints || rawPoints.length < 2) continue
+    const points = rawPoints.map((p) => ({ x: offsetX + p.x, y: p.y }))
+
+    const isNew = !dState.drawnEdgeKeys.has(key)
     dState.drawnEdgeKeys.add(key)
 
-    const arrowId = createShapeId()
-    const fromBox = boxes[edge.from]
-    const toBox = boxes[edge.to]
-
-    editor.store.mergeRemoteChanges(() => {
-      editor.createShape({
-        id: arrowId,
-        type: 'arrow',
-        x: 0,
-        y: 0,
-        props: {
-          // Elbow (orthogonal) routing reads far cleaner than straight
-          // lines once a diagram has more than a couple of edges - it's
-          // what makes a dense node (several edges converging on one box)
-          // legible instead of a knot of crossing diagonals.
-          kind: 'elbow',
-          // Initial points in case binding resolution ever fails - normally
-          // overridden visually once the bindings below attach.
-          start: { x: offsetX + fromBox.x + fromBox.w / 2, y: fromBox.y + fromBox.h / 2 },
-          end: { x: offsetX + toBox.x + toBox.w / 2, y: toBox.y + toBox.h / 2 },
-          richText: toRichText(edge.label ?? ''),
-        },
+    const previousShapeIds = dState.edgeShapeIds[key]
+    if (previousShapeIds) {
+      // A node moved and dagre re-routed this edge - the point count and
+      // path can both change between layout passes, so redraw fresh
+      // rather than trying to patch the old shapes. No stagger: this is a
+      // one-time tidy-up like the node repositioning above, not new
+      // content appearing.
+      editor.store.mergeRemoteChanges(() => {
+        editor.deleteShapes(previousShapeIds)
       })
+      for (const id of previousShapeIds) delete dState.edgeSourceNode[id]
+    }
 
-      // Binding by shape id (not raw coordinates) means the arrow follows
-      // the box automatically if it's later dragged. snap: 'edge' anchors
-      // the elbow route to the shape's edge rather than punching through
-      // its center, which is what elbow routing needs to look right.
-      editor.createBindings([
-        {
-          type: 'arrow',
-          fromId: arrowId,
-          toId: fromShapeId,
-          props: { terminal: 'start', normalizedAnchor: { x: 0.5, y: 0.5 }, isExact: false, isPrecise: false, snap: 'edge' },
-        },
-        {
-          type: 'arrow',
-          fromId: arrowId,
-          toId: toShapeId,
-          props: { terminal: 'end', normalizedAnchor: { x: 0.5, y: 0.5 }, isExact: false, isPrecise: false, snap: 'edge' },
-        },
-      ])
-    })
+    const shapeIds = drawRoutedEdge(editor, points, edge.label, toShapeId)
+    dState.edgeShapeIds[key] = shapeIds
+    dState.edgeSourceNode[shapeIds[shapeIds.length - 1]] = edge.from
 
-    await sleep(EDGE_STAGGER_MS)
+    if (isNew) await sleep(EDGE_STAGGER_MS)
   }
 
   await drawReferenceLinks(editor, diagram, state)
+}
+
+// Draws one edge along dagre's actual computed route (not just a straight
+// or locally-elbowed line between its two endpoints) so it goes around
+// other nodes the way dagre's whole-graph layout intended, instead of
+// cutting through whatever happens to sit between the two shapes.
+//
+// tldraw's arrow shape has no concept of a multi-point path (only a single
+// optional bend), so the route's body - every waypoint except the last -
+// is drawn as an unbound `line` shape (which does support multiple
+// points), and only the final short hop into the target is a real bound
+// `arrow`, which is what gives the edge its arrowhead and lets it snap
+// cleanly onto the target's boundary. That final arrow is deliberately
+// bound at its end only, not its start - binding both ends would make
+// tldraw recompute a direct point-to-point anchor and undo the routing
+// entirely. Returns the created shape ids, source-to-target order (the
+// arrow is always last) - diagramSync.js's edgeSourceNode lookup relies on
+// that final id to recover the semantic source, since this arrow has no
+// start binding to read it from.
+function drawRoutedEdge(editor, points, label, toShapeId) {
+  const shapeIds = []
+
+  editor.store.mergeRemoteChanges(() => {
+    if (points.length > 2) {
+      const bodyPoints = points.slice(0, -1)
+      const lineId = createShapeId()
+      const origin = bodyPoints[0]
+      const indices = getIndices(bodyPoints.length)
+      const linePoints = {}
+      bodyPoints.forEach((p, i) => {
+        const id = `p${i}`
+        linePoints[id] = { id, index: indices[i], x: p.x - origin.x, y: p.y - origin.y }
+      })
+      editor.createShape({
+        id: lineId,
+        type: 'line',
+        x: origin.x,
+        y: origin.y,
+        props: { points: linePoints, spline: 'line' },
+      })
+      shapeIds.push(lineId)
+    }
+
+    const secondLast = points[points.length - 2]
+    const last = points[points.length - 1]
+    const arrowId = createShapeId()
+    editor.createShape({
+      id: arrowId,
+      type: 'arrow',
+      x: 0,
+      y: 0,
+      props: {
+        kind: 'arc',
+        bend: 0,
+        arrowheadStart: 'none',
+        // Fixed start point (the last routed waypoint before the target) -
+        // deliberately unbound, see the function comment above.
+        start: { x: secondLast.x, y: secondLast.y },
+        end: { x: last.x, y: last.y },
+        richText: toRichText(label ?? ''),
+      },
+    })
+    editor.createBindings([
+      {
+        type: 'arrow',
+        fromId: arrowId,
+        toId: toShapeId,
+        props: { terminal: 'end', normalizedAnchor: { x: 0.5, y: 0.5 }, isExact: false, isPrecise: false, snap: 'edge' },
+      },
+    ])
+    shapeIds.push(arrowId)
+  })
+
+  return shapeIds
 }
 
 // Draws a dashed "zooms into / relates to" link from the diagram this one
