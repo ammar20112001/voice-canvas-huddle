@@ -5,6 +5,9 @@ const MAX_NODE_WIDTH = 260
 const NODE_HEIGHT = 60
 const CHAR_WIDTH_ESTIMATE = 8 // rough px/char at the default geo-shape font size
 const NODE_PADDING = 32
+const EDGE_LABEL_CHAR_WIDTH_ESTIMATE = 6.5 // edge labels render smaller than node labels
+const EDGE_LABEL_HEIGHT = 20
+const EDGE_LABEL_PADDING = 10
 
 // Long labels in a fixed-width box either clip or force cramped wrapping
 // that eats into the spacing between nodes - sizing the box to the label
@@ -13,6 +16,16 @@ const NODE_PADDING = 32
 function nodeWidthFor(label) {
   const raw = (label?.length ?? 0) * CHAR_WIDTH_ESTIMATE + NODE_PADDING
   return Math.min(MAX_NODE_WIDTH, Math.max(MIN_NODE_WIDTH, raw))
+}
+
+// dagre only reserves space for nodes by default - an edge's label is
+// invisible to it unless the edge is given a width/height, which dagre
+// treats as a "virtual node" it must route around. Without this, labels
+// were landing directly on top of nodes and other labels whenever the
+// graph had any real density.
+function edgeLabelSize(label) {
+  if (!label) return { width: 0, height: 0 }
+  return { width: label.length * EDGE_LABEL_CHAR_WIDTH_ESTIMATE + EDGE_LABEL_PADDING, height: EDGE_LABEL_HEIGHT }
 }
 
 // Runs dagre layout over one diagram's {nodes, edges} and returns a
@@ -35,7 +48,7 @@ export function layoutDiagram(diagram) {
     g.setNode(node.id, { width: nodeWidthFor(node.label), height: NODE_HEIGHT })
   }
   for (const edge of diagram.edges) {
-    g.setEdge(edge.from, edge.to)
+    g.setEdge(edge.from, edge.to, edgeLabelSize(edge.label))
   }
 
   dagre.layout(g)

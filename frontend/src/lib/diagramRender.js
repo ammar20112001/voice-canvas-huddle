@@ -1,4 +1,4 @@
-import { createShapeId, toRichText } from 'tldraw'
+import { createShapeId, renderPlaintextFromRichText, toRichText } from 'tldraw'
 import { layoutDiagram } from './diagramLayout'
 
 const NODE_STAGGER_MS = 150
@@ -105,16 +105,46 @@ async function drawDiagram(editor, diagram, state) {
         props: { richText: toRichText(diagram.title), w: Math.max(width, 160), autoSize: false },
       })
     })
+  } else if (dState.titleShapeId !== null) {
+    // Keep the title's width in sync as the diagram grows wider.
+    editor.store.mergeRemoteChanges(() => {
+      editor.updateShape({ id: dState.titleShapeId, type: 'text', props: { w: Math.max(width, 160) } })
+    })
   }
 
   for (const node of diagram.nodes) {
-    if (dState.shapeIds[node.id]) continue // already drawn
+    const box = boxes[node.id]
+    const existingId = dState.shapeIds[node.id]
+
+    if (existingId) {
+      // layoutDiagram() recomputes a fresh dagre pass over the WHOLE
+      // diagram every call, and dagre doesn't produce stable absolute
+      // coordinates across separate runs - a node added on this call can
+      // easily get assigned a position that an earlier call already used
+      // for a different node. Leaving already-drawn shapes frozen at their
+      // old position (from the old, now-incompatible coordinate system)
+      // was producing literal overlaps once a diagram grew past its first
+      // draw. Repositioning every existing shape to the new layout each
+      // time keeps the whole diagram internally consistent - existing
+      // nodes can visibly shift when the diagram is extended, which is the
+      // right tradeoff versus silently overlapping garbage. No stagger:
+      // this is a one-time tidy-up, not new content being drawn.
+      editor.store.mergeRemoteChanges(() => {
+        editor.updateShape({
+          id: existingId,
+          type: 'geo',
+          x: offsetX + box.x,
+          y: box.y,
+          props: { w: box.w, h: box.h },
+        })
+      })
+      continue
+    }
 
     const id = createShapeId()
     dState.shapeIds[node.id] = id
     dState.schemaIds[id] = node.id
     state.shapeToDiagram[id] = diagram.id
-    const box = boxes[node.id]
 
     editor.store.mergeRemoteChanges(() => {
       editor.createShape({
@@ -192,13 +222,19 @@ async function drawDiagram(editor, diagram, state) {
   await drawReferenceLinks(editor, diagram, state)
 }
 
-// Draws a dashed "zooms into / relates to" link from whatever this diagram
-// elaborates on (a specific node in another diagram, or that diagram's
-// title if no specific node) to this diagram's own title - so a low-level
-// detail view or a technical-facet diagram stays visibly connected to what
-// it's about without merging the two into one graph. references only ever
-// arrives on the turn a diagram is first created (see backend/server.py's
+// Draws a dashed "zooms into / relates to" link from the diagram this one
+// elaborates on to this diagram's own title - so a low-level detail view or
+// a technical-facet diagram stays visibly connected to what it's about
+// without merging the two into one graph. references only ever arrives on
+// the turn a diagram is first created (see backend/server.py's
 // _new_diagram_from_schema), so this only needs to run once per diagram.
+//
+// Always anchored title-to-title, even when the reference names a specific
+// node - every title sits in the same clear horizontal band above all
+// diagram content (y = -TITLE_HEIGHT), so a title-to-title link never has
+// to cross through unrelated nodes the way a link into the middle of a
+// diagram did. The specific node isn't lost, just no longer drawn as a
+// line through the diagram - it's named in the link's own label instead.
 async function drawReferenceLinks(editor, diagram, state) {
   const dState = getDiagramState(state, diagram.id)
   if (dState.referencesDrawn) return
@@ -209,8 +245,14 @@ async function drawReferenceLinks(editor, diagram, state) {
 
   for (const ref of diagram.references) {
     const targetState = getDiagramState(state, ref.diagram_id)
-    const fromShapeId = ref.node_id ? targetState.shapeIds[ref.node_id] : targetState.titleShapeId
+    const fromShapeId = targetState.titleShapeId
     if (!fromShapeId) continue
+
+    const nodeShapeId = ref.node_id ? targetState.shapeIds[ref.node_id] : null
+    const nodeShape = nodeShapeId ? editor.getShape(nodeShapeId) : null
+    const label = nodeShape
+      ? `${REFERENCE_LABEL}: ${renderPlaintextFromRichText(editor, nodeShape.props.richText)}`
+      : REFERENCE_LABEL
 
     const fromBounds = editor.getShapePageBounds(fromShapeId)
     const toBounds = editor.getShapePageBounds(toShapeId)
@@ -224,11 +266,13 @@ async function drawReferenceLinks(editor, diagram, state) {
         x: 0,
         y: 0,
         props: {
+          // Initial points in case binding resolution ever fails - normally
+          // overridden visually once the bindings below attach.
           start: { x: fromBounds.midX, y: fromBounds.midY },
           end: { x: toBounds.midX, y: toBounds.midY },
           color: 'grey',
           dash: 'dashed',
-          richText: toRichText(REFERENCE_LABEL),
+          richText: toRichText(label),
         },
       })
       editor.createBindings([
