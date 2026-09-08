@@ -153,6 +153,11 @@ async function drawDiagram(editor, diagram, state) {
         x: 0,
         y: 0,
         props: {
+          // Elbow (orthogonal) routing reads far cleaner than straight
+          // lines once a diagram has more than a couple of edges - it's
+          // what makes a dense node (several edges converging on one box)
+          // legible instead of a knot of crossing diagonals.
+          kind: 'elbow',
           // Initial points in case binding resolution ever fails - normally
           // overridden visually once the bindings below attach.
           start: { x: offsetX + fromBox.x + fromBox.w / 2, y: fromBox.y + fromBox.h / 2 },
@@ -162,19 +167,21 @@ async function drawDiagram(editor, diagram, state) {
       })
 
       // Binding by shape id (not raw coordinates) means the arrow follows
-      // the box automatically if it's later dragged.
+      // the box automatically if it's later dragged. snap: 'edge' anchors
+      // the elbow route to the shape's edge rather than punching through
+      // its center, which is what elbow routing needs to look right.
       editor.createBindings([
         {
           type: 'arrow',
           fromId: arrowId,
           toId: fromShapeId,
-          props: { terminal: 'start', normalizedAnchor: { x: 0.5, y: 0.5 }, isExact: false, isPrecise: false, snap: 'none' },
+          props: { terminal: 'start', normalizedAnchor: { x: 0.5, y: 0.5 }, isExact: false, isPrecise: false, snap: 'edge' },
         },
         {
           type: 'arrow',
           fromId: arrowId,
           toId: toShapeId,
-          props: { terminal: 'end', normalizedAnchor: { x: 0.5, y: 0.5 }, isExact: false, isPrecise: false, snap: 'none' },
+          props: { terminal: 'end', normalizedAnchor: { x: 0.5, y: 0.5 }, isExact: false, isPrecise: false, snap: 'edge' },
         },
       ])
     })
