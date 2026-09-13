@@ -99,13 +99,25 @@ Each message gives you JSON with three fields:
 
 Decide ONE of three actions:
 
-"extend" - the instruction adds to or details an EXISTING diagram WITHOUT
-  changing its level of abstraction or facet - it's still the same single
-  coherent view, just more of it. Set "diagram_id" to that diagram's id.
-  "nodes"/"edges" contain ONLY the new elements to add - never repeat a
-  node or edge that already exists in that diagram. Pick new node ids that
-  don't collide with ids already in that diagram (ids only need to be
-  unique within their own diagram, not across diagrams).
+"extend" - the instruction changes an EXISTING diagram WITHOUT changing its
+  level of abstraction or facet - it's still the same single coherent view,
+  just different. Set "diagram_id" to that diagram's id. A single "extend"
+  can add, remove, and rename in the same turn - use whichever of these the
+  instruction actually calls for:
+  - Adding: "nodes"/"edges" contain ONLY the new elements to add - never
+    repeat a node or edge that already exists in that diagram. Pick new
+    node ids that don't collide with ids already in that diagram (ids only
+    need to be unique within their own diagram, not across diagrams).
+  - Removing: "remove_node_ids" (existing node ids to delete - any edge
+    touching a removed node is dropped automatically, no need to also list
+    it) and/or "remove_edges" ({from, to} pairs to delete a specific
+    connection without removing the nodes it connects). Trigger words:
+    "remove", "delete", "take out", "get rid of", "drop that step".
+  - Renaming: "update_nodes" ({id, label} pairs) to change an existing
+    node's label without touching its connections. Trigger words: "rename",
+    "call it X instead", "change the label to".
+  Leave whichever of nodes/edges/remove_node_ids/remove_edges/update_nodes
+  don't apply as empty arrays.
 
 "new_diagram" - the instruction is better served by its own diagram: a
   different topic, a deeper zoom into part of an existing diagram, a
@@ -132,20 +144,25 @@ Output ONLY valid JSON, no prose, no markdown fences, matching this shape:
   "diagram_type": "flow" | "mindmap" | "timeline" | "table" | "text",
   "nodes": [{"id": string, "label": string}],
   "edges": [{"from": string, "to": string, "label": string (optional)}],
+  "remove_node_ids": [string],
+  "remove_edges": [{"from": string, "to": string}],
+  "update_nodes": [{"id": string, "label": string}],
   "references": [{"diagram_id": string, "node_id": string (optional)}]
 }
 
 "diagram_id" is required for "extend" (the id of the diagram being
 extended) and unused otherwise. "title" is used for "new_diagram" and
 "replace_all" (a short name for the new diagram) and unused for "extend".
-"references" is only used for "new_diagram" (omit or leave empty
-otherwise): each entry points at the existing diagram (and, optionally,
-the specific node within it) that this new diagram elaborates, zooms into,
-or otherwise relates to. Omit "node_id" to reference the whole diagram
-rather than one specific part of it. Leave "references" empty for a
-genuinely unrelated new diagram.
+"remove_node_ids"/"remove_edges"/"update_nodes" are only used for "extend"
+(omit or leave empty otherwise) - see above. "references" is only used for
+"new_diagram" (omit or leave empty otherwise): each entry points at the
+existing diagram (and, optionally, the specific node within it) that this
+new diagram elaborates, zooms into, or otherwise relates to. Omit
+"node_id" to reference the whole diagram rather than one specific part of
+it. Leave "references" empty for a genuinely unrelated new diagram.
 
-If the instruction doesn't describe something drawable, return:
+If the instruction doesn't describe something drawable - and doesn't ask
+to remove or rename anything either - return:
 {"action": "extend", "diagram_id": "", "diagram_type": "none", "nodes": [], "edges": []}
 """
 

@@ -88,11 +88,40 @@ function clearCanvas(editor, state) {
 // only, so Jarvis's own draws never get mistaken for (and echoed back as) a
 // manual edit.
 async function drawDiagram(editor, diagram, state) {
-  if (!diagram.nodes?.length) return
-
   const dState = getDiagramState(state, diagram.id)
   dState.title = diagram.title ?? dState.title
   dState.diagramType = diagram.diagram_type ?? dState.diagramType
+
+  // Jarvis can now remove and rename, not just add (see backend/server.py's
+  // _apply_llm_schema) - `diagram` is always the FULL current node/edge
+  // list, so anything tracked in dState that's no longer present here was
+  // deleted this turn and needs its shape torn down too, not just left
+  // orphaned on the canvas.
+  const currentNodeIds = new Set(diagram.nodes?.map((n) => n.id))
+  const currentEdgeKeys = new Set(diagram.edges?.map((e) => edgeKey(e)))
+  const orphanedShapeIds = []
+  for (const [nodeId, shapeId] of Object.entries(dState.shapeIds)) {
+    if (currentNodeIds.has(nodeId)) continue
+    orphanedShapeIds.push(shapeId)
+    delete dState.shapeIds[nodeId]
+    delete dState.schemaIds[shapeId]
+    delete state.shapeToDiagram[shapeId]
+  }
+  for (const [key, edgeShapeIds] of Object.entries(dState.edgeShapeIds)) {
+    if (currentEdgeKeys.has(key)) continue
+    orphanedShapeIds.push(...edgeShapeIds)
+    for (const id of edgeShapeIds) delete dState.edgeSourceNode[id]
+    delete dState.edgeShapeIds[key]
+    dState.drawnEdgeKeys.delete(key)
+  }
+  if (orphanedShapeIds.length) {
+    editor.store.mergeRemoteChanges(() => {
+      editor.deleteShapes(orphanedShapeIds)
+    })
+  }
+
+  if (!diagram.nodes?.length) return // everything in this diagram was removed - nothing left to (re)draw
+
   const { boxes, width, edgePaths } = layoutDiagram(diagram)
   const offsetX = assignRegion(state, diagram.id, width)
 
@@ -138,7 +167,10 @@ async function drawDiagram(editor, diagram, state) {
           type: 'geo',
           x: offsetX + box.x,
           y: box.y,
-          props: { w: box.w, h: box.h },
+          // richText is re-set every pass (not just on a real rename) -
+          // idempotent when unchanged, and simpler than threading through
+          // "did the label actually change" just to skip a cheap no-op.
+          props: { w: box.w, h: box.h, richText: toRichText(node.label ?? '') },
         })
       })
       continue

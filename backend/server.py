@@ -172,29 +172,52 @@ def _apply_llm_schema(diagrams: list, schema: dict) -> tuple[list, dict | None]:
         new_diagrams = [new_diagram]
         return new_diagrams, {"action": "replace_all", "diagrams": new_diagrams}
 
-    if not nodes and not edges:
-        return diagrams, None  # nothing drawable this turn
-
     if action == "new_diagram":
+        if not nodes and not edges:
+            return diagrams, None  # nothing drawable this turn
         new_diagram = _new_diagram_from_schema(schema, diagrams)
         new_diagrams = diagrams + [new_diagram]
         return new_diagrams, {"action": "new_diagram", "diagram": new_diagram}
 
-    # action == "extend"
+    # action == "extend" - can add, remove, and/or rename within one
+    # existing diagram, all in the same turn.
+    remove_node_ids = set(schema.get("remove_node_ids") or [])
+    remove_edge_pairs = {(e.get("from"), e.get("to")) for e in (schema.get("remove_edges") or [])}
+    relabels = {n["id"]: n.get("label") for n in (schema.get("update_nodes") or []) if n.get("id")}
+
+    if not nodes and not edges and not remove_node_ids and not remove_edge_pairs and not relabels:
+        return diagrams, None  # nothing to do this turn
+
     target = next((d for d in diagrams if d["id"] == schema.get("diagram_id")), None)
     if target is None:
-        # The model referenced a diagram that doesn't exist (bad id, or
-        # there are no diagrams yet) - treat the content as its own new
-        # diagram rather than silently dropping it.
+        if not nodes and not edges:
+            # A remove/rename instruction naming a diagram that doesn't
+            # exist (or no diagrams exist yet) - nothing sensible to do.
+            return diagrams, None
+        # The model referenced a diagram that doesn't exist for ADDING
+        # content - treat it as its own new diagram rather than silently
+        # dropping it.
         new_diagram = _new_diagram_from_schema(schema, diagrams)
         new_diagrams = diagrams + [new_diagram]
         return new_diagrams, {"action": "new_diagram", "diagram": new_diagram}
 
     existing_ids = {n["id"] for n in target["nodes"]}
-    merged_nodes = target["nodes"] + [n for n in nodes if n["id"] not in existing_ids]
-    merged_edges = target["edges"] + edges
-    if len(merged_nodes) == len(target["nodes"]) and len(merged_edges) == len(target["edges"]):
-        return diagrams, None  # everything the model sent was already there
+    kept_nodes = []
+    for n in target["nodes"]:
+        if n["id"] in remove_node_ids:
+            continue
+        new_label = relabels.get(n["id"])
+        kept_nodes.append({**n, "label": new_label} if new_label else n)
+    merged_nodes = kept_nodes + [n for n in nodes if n["id"] not in existing_ids]
+
+    def _edge_removed(e):
+        return (e["from"], e["to"]) in remove_edge_pairs or e["from"] in remove_node_ids or e["to"] in remove_node_ids
+
+    kept_edges = [e for e in target["edges"] if not _edge_removed(e)]
+    merged_edges = kept_edges + edges
+
+    if merged_nodes == target["nodes"] and merged_edges == target["edges"]:
+        return diagrams, None  # nothing the model sent actually changed anything
 
     updated = {**target, "nodes": merged_nodes, "edges": merged_edges}
     new_diagrams = [updated if d["id"] == target["id"] else d for d in diagrams]
