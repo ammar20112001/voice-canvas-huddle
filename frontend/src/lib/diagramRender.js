@@ -7,6 +7,7 @@ const EDGE_STAGGER_MS = 100
 const DIAGRAM_GUTTER = 200 // horizontal gap between separate diagrams' regions
 const TITLE_HEIGHT = 40
 const REFERENCE_LABEL = 'zooms into / relates to'
+const STRAIGHT_TOLERANCE_PX = 20 // how far a waypoint may sit off the start->end line and still count as "straight"
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms))
@@ -14,6 +15,23 @@ function sleep(ms) {
 
 function edgeKey(edge) {
   return `${edge.from}->${edge.to}`
+}
+
+// dagre marks a rank crossing with a waypoint even when there's nothing to
+// route around, so most edges technically have 3+ points without actually
+// bending. Only a route whose middle point(s) sit meaningfully off the
+// straight line between its ends needs the non-following routed treatment.
+function isEffectivelyStraight(points) {
+  if (points.length <= 2) return true
+  const start = points[0]
+  const end = points[points.length - 1]
+  const dx = end.x - start.x
+  const dy = end.y - start.y
+  const length = Math.hypot(dx, dy) || 1
+  return points.slice(1, -1).every((p) => {
+    const distanceFromLine = Math.abs(dy * p.x - dx * p.y + end.x * start.y - end.y * start.x) / length
+    return distanceFromLine <= STRAIGHT_TOLERANCE_PX
+  })
 }
 
 // Tracks what's already been drawn across repeated renderSchema() calls, so
@@ -224,7 +242,17 @@ async function drawDiagram(editor, diagram, state) {
       for (const id of previousShapeIds) delete dState.edgeSourceNode[id]
     }
 
-    const shapeIds = drawRoutedEdge(editor, points, edge.label, toShapeId)
+    // dagre inserts an extra waypoint at every rank crossing as an artifact
+    // of its algorithm, even for an edge that's really just a straight
+    // line - routing THOSE through the unbound line+arrow hybrid below
+    // would cost native drag-follow behavior for no actual routing
+    // benefit. Only edges that genuinely bend to avoid something use it;
+    // anything effectively straight gets a normal, fully-bound arrow so
+    // dragging either node keeps it attached, the way tldraw arrows
+    // normally behave.
+    const shapeIds = isEffectivelyStraight(points)
+      ? drawSimpleEdge(editor, fromShapeId, toShapeId, edge.label)
+      : drawRoutedEdge(editor, points, edge.label, toShapeId)
     dState.edgeShapeIds[key] = shapeIds
     dState.edgeSourceNode[shapeIds[shapeIds.length - 1]] = edge.from
 
@@ -232,6 +260,48 @@ async function drawDiagram(editor, diagram, state) {
   }
 
   await drawReferenceLinks(editor, diagram, state)
+}
+
+// Draws a normal arrow bound at both ends, the way tldraw arrows work by
+// default - the box follows automatically if either end is later dragged.
+// Used whenever the route doesn't actually need to bend around anything
+// (see isEffectivelyStraight), since binding both ends is strictly better
+// than the unbound routed path when there's nothing to route around.
+function drawSimpleEdge(editor, fromShapeId, toShapeId, label) {
+  const fromBounds = editor.getShapePageBounds(fromShapeId)
+  const toBounds = editor.getShapePageBounds(toShapeId)
+  const arrowId = createShapeId()
+  editor.store.mergeRemoteChanges(() => {
+    editor.createShape({
+      id: arrowId,
+      type: 'arrow',
+      x: 0,
+      y: 0,
+      props: {
+        kind: 'elbow',
+        // Initial points in case binding resolution ever fails - normally
+        // overridden visually once the bindings below attach.
+        start: fromBounds ? { x: fromBounds.midX, y: fromBounds.midY } : { x: 0, y: 0 },
+        end: toBounds ? { x: toBounds.midX, y: toBounds.midY } : { x: 100, y: 100 },
+        richText: toRichText(label ?? ''),
+      },
+    })
+    editor.createBindings([
+      {
+        type: 'arrow',
+        fromId: arrowId,
+        toId: fromShapeId,
+        props: { terminal: 'start', normalizedAnchor: { x: 0.5, y: 0.5 }, isExact: false, isPrecise: false, snap: 'edge' },
+      },
+      {
+        type: 'arrow',
+        fromId: arrowId,
+        toId: toShapeId,
+        props: { terminal: 'end', normalizedAnchor: { x: 0.5, y: 0.5 }, isExact: false, isPrecise: false, snap: 'edge' },
+      },
+    ])
+  })
+  return [arrowId]
 }
 
 // Draws one edge along dagre's actual computed route (not just a straight
