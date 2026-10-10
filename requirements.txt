@@ -7,3 +7,4 @@ python-dotenv
 setuptools
 fastapi
 uvicorn[standard]
+httpx

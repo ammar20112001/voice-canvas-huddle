@@ -1,51 +1,45 @@
 """
-WebSocket bridge between a browser mic/canvas and the voice -> diagram-schema
-pipeline. Both message types below share the one connection - the browser
-tells binary from text apart by frame type, same as this file does.
+Room-based WebSocket bridge between browsers (mic + whiteboard) and the
+voice -> diagram-schema pipeline.
 
-  browser -> server:  binary WS frames, raw PCM16 audio (16kHz mono, any chunk size)
-  browser -> server:  JSON text WS frames, {"type": "diagram_edit", "diagrams": [...]} -
-                       the full diagram set as it stands after a manual edit
-                       on the canvas (drag, rename, delete, a shape drawn by
-                       hand). Replaces _session.diagrams outright so
-                       Jarvis's next call reflects what's actually on
-                       screen.
-  browser -> server:  JSON text WS frames, {"type": "undo"} - reverts to the
-                       diagram set from before the last change (voice- or
-                       manually-driven) and pushes it back.
-  server -> browser:  JSON text WS frames, one of:
-                       {"action": "extend", "diagram": {...}} - one existing
-                         diagram grew; every other diagram is untouched.
-                       {"action": "new_diagram", "diagram": {...}} - a fresh,
-                         independent diagram was added alongside the rest.
-                       {"action": "replace_all", "diagrams": [...]} - the
-                         full diagram set, used for an explicit clear-and-
-                         restart, an undo, and the resume-on-(re)connect
-                         push below - the frontend redraws everything fresh
-                         in all three cases.
+A call is a *room*: POST /api/rooms mints an unguessable id, and anyone
+who opens https://<domain>/r/<id> joins it. Each participant opens
+/api/ws/rooms/<id>?name=<display name>; the whiteboard itself is NOT
+carried here - it's synced by the separate Node service in sync-server/
+(tldraw's multiplayer), which asks GET /api/rooms/<id> before accepting a
+connection so only rooms minted here exist.
 
-Drawing is voice-gated ("Jarvis"): nothing gets drawn until the wake phrase
-"Start drawing Jarvis" is heard, and drawing stops again on "Stop building
-Jarvis" (see is_wake_phrase()/is_sleep_phrase() in backend/pipeline.py).
-Everything said outside that window is kept as background context so Jarvis
-still understands what's being discussed once it's turned on.
+  browser -> server:  binary WS frames, raw PCM16 audio (16kHz mono). Each
+                       participant's mic is its own connection, so each gets
+                       its own Segmenter - that's the "who said it" signal.
+  browser -> server:  {"type": "diagram_edit", "diagrams": [...]} - the full
+                       diagram set after a manual edit on the shared board.
+                       Ignored if it matches what the room already holds
+                       (the scribe's own Jarvis draws echo back this way).
+  browser -> server:  {"type": "undo"}
+  server -> browser:  {"type": "room", "you": id, "scribe": id,
+                       "participants": [{id, name}]} - sent on every join/leave.
+  server -> browser:  {"type": "resume", "diagrams": [...]} - to the (new)
+                       scribe only, so it can restore a board that's empty.
+  server -> browser:  {"action": "extend" | "new_diagram" | "replace_all", ...}
+                       broadcast to the whole room. Only the *scribe* (the
+                       longest-present participant) lays out and draws it
+                       into the shared tldraw document; everyone else gets the
+                       shapes through sync. See frontend/src/lib/diagramRender.js.
 
-Jarvis keeps a SET of independent diagrams, not one big graph - see
-SYSTEM_PROMPT in pipeline.py. Every change that touches _session.diagrams
-goes through _set_diagrams(), which pushes the previous state onto a history
-stack first, so a bad "replace_all" (misheard instruction, or a genuine
-clear-everything request) is never unrecoverable - an "undo" message pops it
-back.
+Drawing is voice-gated ("Jarvis"): nothing is drawn until the wake phrase
+"Start drawing Jarvis" is heard from anyone in the room, and it stops on
+"Stop building Jarvis". Everything said outside that window is kept as
+background context. See is_wake_phrase()/is_sleep_phrase() in pipeline.py.
 
-The diagram set, transcript, and Jarvis on/off state live in a process-global
-_SessionState (below), not per-connection locals - a dropped connection or a
-deliberate Stop/Start from the frontend resumes the same session instead of
-starting a blank one. On (re)connect, if any diagrams exist, they're sent
-immediately so a freshly (re)loaded frontend can restore them.
+Jarvis keeps a SET of independent diagrams (see SYSTEM_PROMPT in
+pipeline.py). Every change goes through _set_diagrams(), which pushes the
+previous state onto a history stack so "undo" always works.
 
 Run:
-  uvicorn backend.server:app --reload --port 8000
-  (from the repo root, with ANTHROPIC_API_KEY set or in a .env file)
+  uvicorn backend.server:app --port 8000
+  (from the repo root, with OPENROUTER_API_KEY or ANTHROPIC_API_KEY set or in a .env file;
+   see resolve_llm_provider() in pipeline.py for how the provider is picked)
 """
 
 import asyncio
@@ -53,11 +47,13 @@ import json
 import logging
 import os
 import re
+import secrets
 import sys
 import time
+from pathlib import Path
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
 from backend.pipeline import (
@@ -67,6 +63,7 @@ from backend.pipeline import (
     build_background_context,
     is_sleep_phrase,
     is_wake_phrase,
+    resolve_llm_provider,
 )
 
 load_dotenv()
@@ -80,41 +77,94 @@ logging.basicConfig(
 log = logging.getLogger("voice2diagram")
 
 app = FastAPI()
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # local prototype only - tighten before deploying anywhere else
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
-_api_key = os.environ.get("ANTHROPIC_API_KEY")
-if not _api_key:
-    log.error("ANTHROPIC_API_KEY not set in environment.")
+# The frontend talks to this through the same origin (Vite's dev proxy, or
+# the reverse proxy in production), so CORS is off unless explicitly listed.
+_cors_origins = [o.strip() for o in os.environ.get("CORS_ORIGINS", "").split(",") if o.strip()]
+if _cors_origins:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=_cors_origins,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+try:
+    _llm_provider, _api_key = resolve_llm_provider()
+except RuntimeError as e:
+    log.error(str(e))
     sys.exit(1)
 
 # Whisper model load takes a few seconds and is CPU-bound - load once at
-# startup and share across connections rather than per-socket.
+# startup and share across every room and speaker.
 _transcriber = Transcriber()
-_agent = DiagramAgent(_api_key)
+_agent = DiagramAgent(_llm_provider, _api_key)
+# One CPU model shared by every speaker in every room: serialize it rather
+# than letting simultaneous speakers fight for the cores.
+_transcribe_lock = asyncio.Lock()
 
 MAX_DIAGRAM_HISTORY = 50
+MAX_ROOM_SIZE = int(os.environ.get("MAX_ROOM_SIZE", "6"))
+MAX_ROOMS = int(os.environ.get("MAX_ROOMS", "50"))
+ROOM_IDLE_TTL_S = 24 * 3600
+ROOMS_FILE = Path(os.environ.get("ROOMS_FILE", "data/rooms.json"))
 
 
-class _SessionState:
-    """Everything that should survive a WebSocket reconnect. Process-global
-    because this prototype only ever serves one client at a time - real
-    multi-client support would key this by a session id from the frontend
-    instead of sharing one instance."""
+class Client:
+    def __init__(self, ws: WebSocket, name: str):
+        self.id = secrets.token_hex(4)
+        self.ws = ws
+        self.name = name
 
-    def __init__(self):
-        self.diagrams = []  # list of {id, title, diagram_type, nodes, edges}
+
+class Room:
+    """Everything that should survive a participant dropping and
+    rejoining. One per call, keyed by the id in the join link."""
+
+    def __init__(self, room_id: str, diagrams: list | None = None):
+        self.id = room_id
+        self.diagrams = diagrams or []  # list of {id, title, diagram_type, nodes, edges}
         self.diagrams_history = []  # snapshots of self.diagrams, for undo
         self.active = False
         self.transcript_log = []
         self.draw_marker_indices = []
+        self.clients: list[Client] = []  # join order - clients[0] is the scribe
+        self.lock = asyncio.Lock()  # serializes LLM turns so two speakers can't interleave state changes
+        self.last_active = time.time()
 
 
-_session = _SessionState()
+_rooms: dict[str, Room] = {}
+
+
+def _save_rooms() -> None:
+    """Persists room ids and their diagrams so join links and Jarvis's
+    picture survive a backend restart. Best-effort."""
+    try:
+        ROOMS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        data = {rid: {"diagrams": r.diagrams} for rid, r in _rooms.items()}
+        tmp = ROOMS_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data))
+        tmp.replace(ROOMS_FILE)
+    except OSError:
+        log.exception("[ROOMS] failed to persist rooms")
+
+
+def _load_rooms() -> None:
+    try:
+        data = json.loads(ROOMS_FILE.read_text())
+    except (OSError, json.JSONDecodeError):
+        return
+    for rid, saved in data.items():
+        _rooms[rid] = Room(rid, saved.get("diagrams", []))
+    log.info(f"[ROOMS] restored {len(_rooms)} room(s)")
+
+
+_load_rooms()
+
+
+def _clean_name(raw: str) -> str:
+    name = re.sub(r"[^\w .'-]", "", raw or "").strip()[:40]
+    return name or "Guest"
 
 
 def _make_diagram_id(title: str, diagrams: list) -> str:
@@ -224,25 +274,65 @@ def _apply_llm_schema(diagrams: list, schema: dict) -> tuple[list, dict | None]:
     return new_diagrams, {"action": "extend", "diagram": updated}
 
 
-def _set_diagrams(new_diagrams: list) -> None:
-    """The one place _session.diagrams is ever reassigned - always pushes
-    the previous state onto history first, so any change (voice-driven or
-    a manual edit) can be undone."""
-    _session.diagrams_history.append(_session.diagrams)
-    if len(_session.diagrams_history) > MAX_DIAGRAM_HISTORY:
-        _session.diagrams_history.pop(0)
-    _session.diagrams = new_diagrams
+def _same_diagrams(a: list, b: list) -> bool:
+    """Whether two diagram sets say the same thing - ignoring order and any
+    extra fields (references, node metadata). Used to drop the echo of
+    Jarvis's own draw coming back as a "manual edit"."""
+
+    def norm(diagrams):
+        out = {}
+        for d in diagrams or []:
+            nodes = frozenset((n["id"], n.get("label") or "") for n in d.get("nodes", []))
+            edges = frozenset((e["from"], e["to"], e.get("label") or "") for e in d.get("edges", []))
+            out[d["id"]] = (nodes, edges)
+        return out
+
+    try:
+        return norm(a) == norm(b)
+    except (KeyError, TypeError):
+        return False
 
 
-def _undo() -> list | None:
-    if not _session.diagrams_history:
+def _set_diagrams(room: Room, new_diagrams: list) -> None:
+    """The one place room.diagrams is ever reassigned - always pushes the
+    previous state onto history first, so any change (voice-driven or a
+    manual edit) can be undone."""
+    room.diagrams_history.append(room.diagrams)
+    if len(room.diagrams_history) > MAX_DIAGRAM_HISTORY:
+        room.diagrams_history.pop(0)
+    room.diagrams = new_diagrams
+    _save_rooms()
+
+
+def _undo(room: Room) -> list | None:
+    if not room.diagrams_history:
         return None
-    _session.diagrams = _session.diagrams_history.pop()
-    log.info(f"[WS] undo -> {len(_session.diagrams)} diagram(s)")
-    return _session.diagrams
+    room.diagrams = room.diagrams_history.pop()
+    _save_rooms()
+    log.info(f"[WS] room {room.id}: undo -> {len(room.diagrams)} diagram(s)")
+    return room.diagrams
 
 
-async def _handle_text_message(raw_text: str, ws: WebSocket) -> None:
+async def _send(client: Client, message: dict) -> None:
+    try:
+        await client.ws.send_json(message)
+    except Exception:
+        pass  # a dead socket gets cleaned up by its own receive loop
+
+
+async def _broadcast(room: Room, message: dict) -> None:
+    for client in list(room.clients):
+        await _send(client, message)
+
+
+async def _send_roster(room: Room) -> None:
+    scribe_id = room.clients[0].id if room.clients else None
+    participants = [{"id": c.id, "name": c.name} for c in room.clients]
+    for client in list(room.clients):
+        await _send(client, {"type": "room", "you": client.id, "scribe": scribe_id, "participants": participants})
+
+
+async def _handle_text_message(raw_text: str, room: Room, client: Client) -> None:
     try:
         payload = json.loads(raw_text)
     except json.JSONDecodeError:
@@ -252,49 +342,75 @@ async def _handle_text_message(raw_text: str, ws: WebSocket) -> None:
     msg_type = payload.get("type")
 
     if msg_type == "diagram_edit":
+        diagrams = payload.get("diagrams", [])
+        if not isinstance(diagrams, list) or _same_diagrams(diagrams, room.diagrams):
+            return
         # The frontend reports the full current shape set (deletions
         # included), so this replaces outright rather than merging - a
-        # merge would resurrect anything the user just deleted by hand.
-        _set_diagrams(payload.get("diagrams", []))
-        log.info(f"[WS] adopted manually edited diagram set - {len(_session.diagrams)} diagram(s)")
+        # merge would resurrect anything someone just deleted by hand.
+        _set_diagrams(room, diagrams)
+        log.info(f"[WS] room {room.id}: adopted manual edit from {client.name} - {len(diagrams)} diagram(s)")
         return
 
     if msg_type == "undo":
-        restored = _undo()
+        restored = _undo(room)
         if restored is None:
-            log.info("[WS] undo requested but there's no history to revert to")
             return
-        await ws.send_json({"action": "replace_all", "diagrams": restored})
+        await _broadcast(room, {"action": "replace_all", "diagrams": restored})
         return
 
     log.warning(f"[WS] unknown message type, ignoring: {msg_type!r}")
 
 
-@app.websocket("/ws/audio")
-async def audio_socket(ws: WebSocket):
-    await ws.accept()
-    log.info("[WS] client connected")
+def _prune_rooms() -> None:
+    now = time.time()
+    for rid in [r for r, room in _rooms.items() if not room.clients and now - room.last_active > ROOM_IDLE_TTL_S]:
+        del _rooms[rid]
 
-    # Jarvis only draws between a wake phrase ("Start drawing Jarvis") and a
-    # sleep phrase ("Stop building Jarvis") - see backend/pipeline.py's
-    # is_wake_phrase()/is_sleep_phrase(). Everything transcribed outside
-    # that window is kept as background_context instead of being drawn.
-    # While active, every transcribed chunk (roughly every 5s during
-    # continuous speech - see Segmenter's STREAM_FLUSH_MS - or sooner on a
-    # natural pause) goes straight to the LLM; there's no local "is this a
-    # complete sentence" gate holding it back. The model itself decides
-    # per-turn whether a fragment is drawable yet (falling back to a no-op
-    # extend when it isn't), which is both faster and more accurate than a
-    # regex completeness heuristic.
-    #
-    # All of that state lives on the shared _session (see _SessionState),
-    # not as locals here, so it survives this connection ending.
-    if _session.diagrams:
-        log.info(f"[WS] resuming persisted session - {len(_session.diagrams)} diagram(s), active={_session.active}")
-        await ws.send_json({"action": "replace_all", "diagrams": _session.diagrams})
+
+@app.post("/api/rooms")
+def create_room():
+    _prune_rooms()
+    if len(_rooms) >= MAX_ROOMS:
+        raise HTTPException(status_code=503, detail="too many rooms")
+    room_id = secrets.token_urlsafe(9)  # 72 bits - unguessable, the link IS the credential
+    _rooms[room_id] = Room(room_id)
+    _save_rooms()
+    log.info(f"[ROOMS] created {room_id}")
+    return {"id": room_id}
+
+
+@app.get("/api/rooms/{room_id}")
+def get_room(room_id: str):
+    room = _rooms.get(room_id)
+    if room is None:
+        raise HTTPException(status_code=404, detail="no such room")
+    return {"id": room.id, "participants": len(room.clients), "capacity": MAX_ROOM_SIZE}
+
+
+@app.websocket("/api/ws/rooms/{room_id}")
+async def room_socket(ws: WebSocket, room_id: str, name: str = ""):
+    room = _rooms.get(room_id)
+    if room is None:
+        await ws.close(code=4404)
+        return
+    if len(room.clients) >= MAX_ROOM_SIZE:
+        await ws.close(code=4403)
+        return
+
+    await ws.accept()
+    client = Client(ws, _clean_name(name))
+    room.clients.append(client)
+    room.last_active = time.time()
+    log.info(f"[WS] room {room.id}: {client.name} joined ({len(room.clients)} in room)")
+
+    await _send_roster(room)
+    if room.clients[0] is client:
+        await _send(client, {"type": "resume", "diagrams": room.diagrams})
 
     # Per-connection: audio buffering/timing has no meaning across a drop,
-    # so this - unlike _session - starts fresh every time.
+    # so this starts fresh every time - and being per-connection it is
+    # also per-speaker.
     segmenter = Segmenter()
 
     try:
@@ -304,7 +420,7 @@ async def audio_socket(ws: WebSocket):
                 raise WebSocketDisconnect(message.get("code", 1000))
 
             if message.get("text") is not None:
-                await _handle_text_message(message["text"], ws)
+                await _handle_text_message(message["text"], room, client)
                 continue
 
             chunk = message.get("bytes")
@@ -314,8 +430,7 @@ async def audio_socket(ws: WebSocket):
             # Nothing below this point should ever be allowed to kill the
             # connection - a bad audio chunk, a Whisper hiccup, or a flaky
             # Anthropic call should be logged and skipped, not drop the
-            # socket. Only an actual client disconnect (or task
-            # cancellation, e.g. server shutdown) should end the loop.
+            # socket.
             try:
                 utterances = segmenter.feed(chunk)
             except Exception:
@@ -328,53 +443,72 @@ async def audio_socket(ws: WebSocket):
 
                     # faster-whisper and the Anthropic client are both
                     # blocking calls - run them off the event loop so other
-                    # connections (and this one's audio receive loop) aren't
-                    # stalled.
-                    text = await asyncio.to_thread(_transcriber.transcribe, pcm16_bytes, duration_s)
+                    # connections aren't stalled.
+                    async with _transcribe_lock:
+                        text = await asyncio.to_thread(_transcriber.transcribe, pcm16_bytes, duration_s)
                     if not text:
                         log.info("[PIPE] empty transcription, discarding utterance")
                         continue
 
-                    if is_wake_phrase(text):
-                        _session.transcript_log.append(text)
-                        if not _session.active:
-                            _session.active = True
-                            log.info(f"[JARVIS] wake phrase in \"{text}\" - now active")
-                        continue
+                    # With more than one person in the room the model needs
+                    # to know who's talking.
+                    spoken = f"{client.name}: {text}" if len(room.clients) > 1 else text
 
-                    if is_sleep_phrase(text):
-                        _session.transcript_log.append(text)
-                        if _session.active:
-                            _session.active = False
-                            log.info(f"[JARVIS] sleep phrase in \"{text}\" - now inactive")
-                        continue
+                    async with room.lock:
+                        if is_wake_phrase(text):
+                            room.transcript_log.append(spoken)
+                            if not room.active:
+                                room.active = True
+                                log.info(f"[JARVIS] room {room.id}: wake phrase from {client.name} - now active")
+                            continue
 
-                    if not _session.active:
-                        _session.transcript_log.append(text)
-                        log.info(f"[JARVIS] inactive, logged as background context: \"{text}\"")
-                        continue
+                        if is_sleep_phrase(text):
+                            room.transcript_log.append(spoken)
+                            if room.active:
+                                room.active = False
+                                log.info(f"[JARVIS] room {room.id}: sleep phrase from {client.name} - now inactive")
+                            continue
 
-                    background_context = build_background_context(_session.transcript_log, _session.draw_marker_indices)
-                    _session.transcript_log.append(text)
-                    schema = await asyncio.to_thread(_agent.generate, text, _session.diagrams, background_context)
-                    total = time.perf_counter() - pipeline_t0
+                        if not room.active:
+                            room.transcript_log.append(spoken)
+                            log.info(f"[JARVIS] inactive, logged as background context: \"{spoken}\"")
+                            continue
 
-                    new_diagrams, ws_message = _apply_llm_schema(_session.diagrams, schema)
-                    if ws_message is None:
-                        log.info(f"[PIPE] total time: {total:.2f}s, no drawable change, keeping diagrams as is")
-                        continue
+                        background_context = build_background_context(room.transcript_log, room.draw_marker_indices)
+                        room.transcript_log.append(spoken)
+                        schema = await asyncio.to_thread(_agent.generate, spoken, room.diagrams, background_context)
+                        total = time.perf_counter() - pipeline_t0
 
-                    _set_diagrams(new_diagrams)
-                    _session.draw_marker_indices.append(len(_session.transcript_log))
-                    log.info(
-                        f"[PIPE] total time from utterance end to schema ready: {total:.2f}s, "
-                        f"action={ws_message['action']}, {len(_session.diagrams)} diagram(s) total"
-                    )
-                    await ws.send_json(ws_message)
+                        new_diagrams, ws_message = _apply_llm_schema(room.diagrams, schema)
+                        if ws_message is None:
+                            log.info(f"[PIPE] total time: {total:.2f}s, no drawable change, keeping diagrams as is")
+                            continue
+
+                        _set_diagrams(room, new_diagrams)
+                        room.draw_marker_indices.append(len(room.transcript_log))
+                        log.info(
+                            f"[PIPE] room {room.id}: {total:.2f}s from utterance end to schema ready, "
+                            f"action={ws_message['action']}, {len(room.diagrams)} diagram(s) total"
+                        )
+                        await _broadcast(room, ws_message)
                 except (WebSocketDisconnect, asyncio.CancelledError):
                     raise
                 except Exception:
                     log.exception("[PIPE] error processing utterance - continuing")
                     continue
     except WebSocketDisconnect:
-        log.info("[WS] client disconnected")
+        pass
+    finally:
+        was_scribe = bool(room.clients) and room.clients[0] is client
+        if client in room.clients:
+            room.clients.remove(client)
+        room.last_active = time.time()
+        log.info(f"[WS] room {room.id}: {client.name} left ({len(room.clients)} in room)")
+        if room.clients:
+            await _send_roster(room)
+            if was_scribe:
+                await _send(room.clients[0], {"type": "resume", "diagrams": room.diagrams})
+        else:
+            # Last one out: don't carry a half-finished "listening" state
+            # into whoever opens the link next.
+            room.active = False

@@ -1,49 +1,26 @@
 import { getArrowBindings, renderPlaintextFromRichText } from 'tldraw'
-import { getDiagramState } from './diagramRender'
+import { getDiagramState, isRendering, rebuildRenderState } from './diagramRender'
 
-// Watches the canvas for manual edits (drag, rename, delete, a shape drawn
-// by hand) and streams the resulting diagram set back to the backend over
-// the same WebSocket used for audio, as a JSON text message - so Jarvis's
-// next LLM call reflects what's actually on screen instead of drifting
-// from it.
+// Watches the shared board for manual edits (drag, rename, delete, a shape
+// drawn by hand - by ANY participant) and reports the resulting diagram set
+// to the backend over the room WebSocket, so Jarvis's next LLM call
+// reflects what's actually on screen instead of drifting from it.
 //
-// Only fires for source: 'user' changes. diagramRender.js wraps every
-// AI-driven mutation in editor.store.mergeRemoteChanges(), which tags them
-// source: 'remote', so Jarvis's own draws never get picked up here and
-// echoed straight back as if they were a manual edit.
+// Every client reports its own local edits. The diagram/node mapping comes
+// from the document itself (rebuildRenderState reads shape.meta), not from
+// in-memory state, so it works for whoever happens to be editing.
+//
+// Only source:'user' changes fire this - edits arriving from other
+// participants over tldraw sync are 'remote' and are reported by whoever
+// made them. The scribe's own Jarvis draws DO look like user edits locally;
+// those are held back while a render is in flight (isRendering) and the
+// backend drops the resulting report as a no-op since it already holds
+// that exact diagram set.
 const SYNC_DEBOUNCE_MS = 600
 const MANUAL_DIAGRAM_ID = 'manual'
 
-function nearestDiagramId(shape, state) {
-  const entries = Object.entries(state.regionOffsets)
-  if (!entries.length) return null
-  let bestId = null
-  let bestDist = Infinity
-  for (const [diagramId, offsetX] of entries) {
-    const regionWidth = state.diagrams[diagramId]?.width || 0
-    const regionCenter = offsetX + regionWidth / 2
-    const dist = Math.abs(shape.x - regionCenter)
-    if (dist < bestDist) {
-      bestDist = dist
-      bestId = diagramId
-    }
-  }
-  return bestId
-}
-
-// A shape the user drew by hand has no diagram association yet - group it
-// with whichever existing diagram's region it's closest to (probably drawn
-// near/inside that cluster), or a shared catch-all "Manual edits" diagram
-// if the canvas has none yet.
-function diagramIdForShape(shape, state) {
-  const known = state.shapeToDiagram[shape.id]
-  if (known) return known
-  const diagramId = nearestDiagramId(shape, state) ?? MANUAL_DIAGRAM_ID
-  state.shapeToDiagram[shape.id] = diagramId
-  return diagramId
-}
-
-function serializeDiagrams(editor, state) {
+function serializeDiagrams(editor) {
+  const state = rebuildRenderState(editor)
   const shapes = editor.getCurrentPageShapes()
   const buckets = {} // diagramId -> {id, title, diagram_type, nodes, edges}
 
@@ -63,15 +40,10 @@ function serializeDiagrams(editor, state) {
 
   for (const shape of shapes) {
     if (shape.type !== 'geo') continue
-    const diagramId = diagramIdForShape(shape, state)
+    const diagramId = state.shapeToDiagram[shape.id] ?? MANUAL_DIAGRAM_ID
     const dState = getDiagramState(state, diagramId)
-
-    let nodeId = dState.schemaIds[shape.id]
-    if (!nodeId) {
-      nodeId = `user_${shape.id.replace('shape:', '')}`
-      dState.schemaIds[shape.id] = nodeId
-      dState.shapeIds[nodeId] = shape.id
-    }
+    const nodeId = dState.schemaIds[shape.id]
+    if (!nodeId) continue
     bucketFor(diagramId).nodes.push({ id: nodeId, label: renderPlaintextFromRichText(editor, shape.props.richText) })
   }
 
@@ -105,19 +77,21 @@ function serializeDiagrams(editor, state) {
 
 // Returns a cleanup function - call it when the WebSocket this was set up
 // for closes (a new one needs its own watcher).
-export function watchForManualEdits(editor, ws, state) {
+export function watchForManualEdits(editor, ws) {
   let debounceTimer = null
 
-  const unsubscribe = editor.store.listen(
-    () => {
-      clearTimeout(debounceTimer)
-      debounceTimer = setTimeout(() => {
-        if (ws.readyState !== WebSocket.OPEN) return
-        ws.send(JSON.stringify({ type: 'diagram_edit', diagrams: serializeDiagrams(editor, state) }))
-      }, SYNC_DEBOUNCE_MS)
-    },
-    { source: 'user', scope: 'document' }
-  )
+  function arm() {
+    clearTimeout(debounceTimer)
+    debounceTimer = setTimeout(flush, SYNC_DEBOUNCE_MS)
+  }
+
+  function flush() {
+    if (ws.readyState !== WebSocket.OPEN) return
+    if (isRendering()) return arm() // mid-draw: the board is only partly drawn
+    ws.send(JSON.stringify({ type: 'diagram_edit', diagrams: serializeDiagrams(editor) }))
+  }
+
+  const unsubscribe = editor.store.listen(arm, { source: 'user', scope: 'document' })
 
   return function stopWatchingForManualEdits() {
     clearTimeout(debounceTimer)

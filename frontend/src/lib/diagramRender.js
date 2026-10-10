@@ -1,4 +1,4 @@
-import { createShapeId, renderPlaintextFromRichText, toRichText } from 'tldraw'
+import { createShapeId, getArrowBindings, renderPlaintextFromRichText, toRichText } from 'tldraw'
 import { getIndices } from '@tldraw/utils'
 import { layoutDiagram } from './diagramLayout'
 
@@ -8,6 +8,35 @@ const DIAGRAM_GUTTER = 200 // horizontal gap between separate diagrams' regions
 const TITLE_HEIGHT = 40
 const REFERENCE_LABEL = 'zooms into / relates to'
 const STRAIGHT_TOLERANCE_PX = 20 // how far a waypoint may sit off the start->end line and still count as "straight"
+
+const MANUAL_DIAGRAM_ID = 'manual'
+
+// Every shape Jarvis draws is tagged `meta.jv` so the shared document alone
+// says which diagram/node/edge it belongs to - any participant can then
+// rebuild the render state (rebuildRenderState) instead of it living in one
+// browser's memory, which is what lets the scribe role move between people
+// and lets every client report manual edits correctly:
+//   node  (geo):   { d: diagramId, n: nodeId }
+//   title (text):  { d: diagramId, t: 1, type: diagramType, refsDone?: 1 }
+//   edge shapes:   { d: diagramId, e: "from->to", from: nodeId }
+//   reference arrow: { d: diagramId, ref: 1 }
+const tag = (meta) => ({ jv: meta })
+
+// Jarvis's draws are ordinary shared edits - tldraw sync only uploads
+// source:'user' changes, so (unlike the single-user version) they must NOT
+// be wrapped in store.mergeRemoteChanges(). history:'ignore' keeps them out
+// of each person's local Ctrl+Z stack; the Undo button goes through the
+// backend instead.
+function mutate(editor, fn) {
+  editor.run(fn, { history: 'ignore' })
+}
+
+let renderingCount = 0
+// True while a render is in flight - diagramSync.js holds off reporting
+// "manual edits" then, since the scribe's own draws look like user edits.
+export function isRendering() {
+  return renderingCount > 0
+}
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms))
@@ -66,6 +95,92 @@ export function getDiagramState(state, diagramId) {
   return state.diagrams[diagramId]
 }
 
+function nearestDiagramId(shape, state) {
+  const entries = Object.entries(state.regionOffsets)
+  if (!entries.length) return null
+  let bestId = null
+  let bestDist = Infinity
+  for (const [diagramId, offsetX] of entries) {
+    const regionWidth = state.diagrams[diagramId]?.width || 0
+    const dist = Math.abs(shape.x - (offsetX + regionWidth / 2))
+    if (dist < bestDist) {
+      bestDist = dist
+      bestId = diagramId
+    }
+  }
+  return bestId
+}
+
+// Reconstructs the whole render state from the shared document alone (see
+// the meta scheme at the top of this file). Called before every render and
+// every manual-edit report, so no browser holds state the others lack.
+//
+// A geo shape without Jarvis meta was drawn by hand: it joins the diagram
+// whose region it sits nearest (or a shared catch-all "manual" diagram),
+// with a node id derived from its shape id so it's stable across clients.
+export function rebuildRenderState(editor) {
+  const state = createRenderState()
+  const shapes = editor.getCurrentPageShapes()
+
+  for (const shape of shapes) {
+    const jv = shape.meta?.jv
+    if (shape.type !== 'text' || !jv?.t) continue
+    const dState = getDiagramState(state, jv.d)
+    dState.titleShapeId = shape.id
+    dState.title = renderPlaintextFromRichText(editor, shape.props.richText)
+    dState.diagramType = jv.type ?? null
+    dState.width = Math.max(dState.width, shape.props.w ?? 0)
+    dState.referencesDrawn = !!jv.refsDone
+    state.regionOffsets[jv.d] = shape.x
+  }
+  state.order = Object.keys(state.regionOffsets).sort((a, b) => state.regionOffsets[a] - state.regionOffsets[b])
+
+  for (const shape of shapes) {
+    if (shape.type !== 'geo') continue
+    const jv = shape.meta?.jv
+    let diagramId
+    let nodeId
+    if (jv?.n) {
+      diagramId = jv.d
+      nodeId = jv.n
+    } else {
+      diagramId = nearestDiagramId(shape, state) ?? MANUAL_DIAGRAM_ID
+      nodeId = `user_${shape.id.replace('shape:', '')}`
+    }
+    const dState = getDiagramState(state, diagramId)
+    dState.shapeIds[nodeId] = shape.id
+    dState.schemaIds[shape.id] = nodeId
+    state.shapeToDiagram[shape.id] = diagramId
+  }
+
+  for (const shape of shapes) {
+    const jv = shape.meta?.jv
+    if (jv?.e) {
+      const dState = getDiagramState(state, jv.d)
+      dState.drawnEdgeKeys.add(jv.e)
+      ;(dState.edgeShapeIds[jv.e] ??= []).push(shape.id)
+      if (shape.type === 'arrow' && jv.from) dState.edgeSourceNode[shape.id] = jv.from
+      continue
+    }
+    // A hand-drawn arrow between two nodes: register it so a later Jarvis
+    // pass replaces it instead of drawing a second arrow on top of it.
+    if (shape.type !== 'arrow' || jv) continue
+    const bindings = getArrowBindings(editor, shape)
+    const toDiagram = bindings.end && state.shapeToDiagram[bindings.end.toId]
+    if (!toDiagram) continue
+    const dState = getDiagramState(state, toDiagram)
+    const toNode = dState.schemaIds[bindings.end.toId]
+    const fromNode = bindings.start ? dState.schemaIds[bindings.start.toId] : null
+    if (!toNode || !fromNode) continue
+    const key = `${fromNode}->${toNode}`
+    dState.drawnEdgeKeys.add(key)
+    ;(dState.edgeShapeIds[key] ??= []).push(shape.id)
+    dState.edgeSourceNode[shape.id] = fromNode
+  }
+
+  return state
+}
+
 // Assigns each diagram a horizontal region on the shared canvas so separate
 // diagrams never overlap. A region's offset is fixed the first time a
 // diagram is drawn and never moves afterward - if a diagram later grows
@@ -89,7 +204,7 @@ function assignRegion(state, diagramId, width) {
 function clearCanvas(editor, state) {
   const existingIds = Array.from(editor.getCurrentPageShapeIds())
   if (existingIds.length) {
-    editor.store.mergeRemoteChanges(() => {
+    mutate(editor, () => {
       editor.deleteShapes(existingIds)
     })
   }
@@ -133,7 +248,7 @@ async function drawDiagram(editor, diagram, state) {
     dState.drawnEdgeKeys.delete(key)
   }
   if (orphanedShapeIds.length) {
-    editor.store.mergeRemoteChanges(() => {
+    mutate(editor, () => {
       editor.deleteShapes(orphanedShapeIds)
     })
   }
@@ -146,18 +261,19 @@ async function drawDiagram(editor, diagram, state) {
   if (dState.titleShapeId === null && diagram.title) {
     const titleId = createShapeId()
     dState.titleShapeId = titleId
-    editor.store.mergeRemoteChanges(() => {
+    mutate(editor, () => {
       editor.createShape({
         id: titleId,
         type: 'text',
         x: offsetX,
         y: -TITLE_HEIGHT,
         props: { richText: toRichText(diagram.title), w: Math.max(width, 160), autoSize: false },
+        meta: tag({ d: diagram.id, t: 1, type: diagram.diagram_type ?? null }),
       })
     })
   } else if (dState.titleShapeId !== null) {
     // Keep the title's width in sync as the diagram grows wider.
-    editor.store.mergeRemoteChanges(() => {
+    mutate(editor, () => {
       editor.updateShape({ id: dState.titleShapeId, type: 'text', props: { w: Math.max(width, 160) } })
     })
   }
@@ -179,7 +295,7 @@ async function drawDiagram(editor, diagram, state) {
       // nodes can visibly shift when the diagram is extended, which is the
       // right tradeoff versus silently overlapping garbage. No stagger:
       // this is a one-time tidy-up, not new content being drawn.
-      editor.store.mergeRemoteChanges(() => {
+      mutate(editor, () => {
         editor.updateShape({
           id: existingId,
           type: 'geo',
@@ -199,7 +315,7 @@ async function drawDiagram(editor, diagram, state) {
     dState.schemaIds[id] = node.id
     state.shapeToDiagram[id] = diagram.id
 
-    editor.store.mergeRemoteChanges(() => {
+    mutate(editor, () => {
       editor.createShape({
         id,
         type: 'geo',
@@ -211,6 +327,7 @@ async function drawDiagram(editor, diagram, state) {
           h: box.h,
           richText: toRichText(node.label ?? ''),
         },
+        meta: tag({ d: diagram.id, n: node.id }),
       })
     })
     await sleep(NODE_STAGGER_MS)
@@ -226,6 +343,7 @@ async function drawDiagram(editor, diagram, state) {
     if (!rawPoints || rawPoints.length < 2) continue
     const points = rawPoints.map((p) => ({ x: offsetX + p.x, y: p.y }))
 
+    const edgeMeta = tag({ d: diagram.id, e: key, from: edge.from })
     const isNew = !dState.drawnEdgeKeys.has(key)
     dState.drawnEdgeKeys.add(key)
 
@@ -236,7 +354,7 @@ async function drawDiagram(editor, diagram, state) {
       // rather than trying to patch the old shapes. No stagger: this is a
       // one-time tidy-up like the node repositioning above, not new
       // content appearing.
-      editor.store.mergeRemoteChanges(() => {
+      mutate(editor, () => {
         editor.deleteShapes(previousShapeIds)
       })
       for (const id of previousShapeIds) delete dState.edgeSourceNode[id]
@@ -251,8 +369,8 @@ async function drawDiagram(editor, diagram, state) {
     // dragging either node keeps it attached, the way tldraw arrows
     // normally behave.
     const shapeIds = isEffectivelyStraight(points)
-      ? drawSimpleEdge(editor, fromShapeId, toShapeId, edge.label)
-      : drawRoutedEdge(editor, points, edge.label, toShapeId)
+      ? drawSimpleEdge(editor, fromShapeId, toShapeId, edge.label, edgeMeta)
+      : drawRoutedEdge(editor, points, edge.label, toShapeId, edgeMeta)
     dState.edgeShapeIds[key] = shapeIds
     dState.edgeSourceNode[shapeIds[shapeIds.length - 1]] = edge.from
 
@@ -267,11 +385,11 @@ async function drawDiagram(editor, diagram, state) {
 // Used whenever the route doesn't actually need to bend around anything
 // (see isEffectivelyStraight), since binding both ends is strictly better
 // than the unbound routed path when there's nothing to route around.
-function drawSimpleEdge(editor, fromShapeId, toShapeId, label) {
+function drawSimpleEdge(editor, fromShapeId, toShapeId, label, meta) {
   const fromBounds = editor.getShapePageBounds(fromShapeId)
   const toBounds = editor.getShapePageBounds(toShapeId)
   const arrowId = createShapeId()
-  editor.store.mergeRemoteChanges(() => {
+  mutate(editor, () => {
     editor.createShape({
       id: arrowId,
       type: 'arrow',
@@ -285,6 +403,7 @@ function drawSimpleEdge(editor, fromShapeId, toShapeId, label) {
         end: toBounds ? { x: toBounds.midX, y: toBounds.midY } : { x: 100, y: 100 },
         richText: toRichText(label ?? ''),
       },
+      meta,
     })
     editor.createBindings([
       {
@@ -321,10 +440,10 @@ function drawSimpleEdge(editor, fromShapeId, toShapeId, label) {
 // arrow is always last) - diagramSync.js's edgeSourceNode lookup relies on
 // that final id to recover the semantic source, since this arrow has no
 // start binding to read it from.
-function drawRoutedEdge(editor, points, label, toShapeId) {
+function drawRoutedEdge(editor, points, label, toShapeId, meta) {
   const shapeIds = []
 
-  editor.store.mergeRemoteChanges(() => {
+  mutate(editor, () => {
     if (points.length > 2) {
       const bodyPoints = points.slice(0, -1)
       const lineId = createShapeId()
@@ -341,6 +460,7 @@ function drawRoutedEdge(editor, points, label, toShapeId) {
         x: origin.x,
         y: origin.y,
         props: { points: linePoints, spline: 'line' },
+        meta,
       })
       shapeIds.push(lineId)
     }
@@ -363,6 +483,7 @@ function drawRoutedEdge(editor, points, label, toShapeId) {
         end: { x: last.x, y: last.y },
         richText: toRichText(label ?? ''),
       },
+      meta,
     })
     editor.createBindings([
       {
@@ -395,6 +516,19 @@ async function drawReferenceLinks(editor, diagram, state) {
   const dState = getDiagramState(state, diagram.id)
   if (dState.referencesDrawn) return
   dState.referencesDrawn = true
+  if (dState.titleShapeId) {
+    // Persisted on the title so a different scribe doesn't draw the links twice.
+    const titleShape = editor.getShape(dState.titleShapeId)
+    if (titleShape) {
+      mutate(editor, () => {
+        editor.updateShape({
+          id: titleShape.id,
+          type: 'text',
+          meta: { ...titleShape.meta, jv: { ...titleShape.meta?.jv, refsDone: 1 } },
+        })
+      })
+    }
+  }
 
   const toShapeId = dState.titleShapeId
   if (!toShapeId || !diagram.references?.length) return
@@ -415,7 +549,7 @@ async function drawReferenceLinks(editor, diagram, state) {
     if (!fromBounds || !toBounds) continue
 
     const linkId = createShapeId()
-    editor.store.mergeRemoteChanges(() => {
+    mutate(editor, () => {
       editor.createShape({
         id: linkId,
         type: 'arrow',
@@ -430,6 +564,7 @@ async function drawReferenceLinks(editor, diagram, state) {
           dash: 'dashed',
           richText: toRichText(label),
         },
+        meta: tag({ d: diagram.id, ref: 1 }),
       })
       editor.createBindings([
         {
@@ -451,29 +586,54 @@ async function drawReferenceLinks(editor, diagram, state) {
   }
 }
 
-// Renders a server message onto the tldraw canvas:
+// Renders a server message onto the shared tldraw document:
 //   {action: "extend", diagram} - draws only what's new into that diagram's
 //     existing region; every other diagram is left untouched.
 //   {action: "new_diagram", diagram} - assigns a fresh region and draws the
 //     whole diagram there; every other diagram is left untouched.
 //   {action: "replace_all", diagrams} - clears the canvas and (re)draws every
 //     diagram fresh. Used for an explicit clear-and-restart, an undo, and
-//     the resume-on-reconnect push - the frontend treats all three the same
-//     way.
-export async function renderSchema(editor, message, state) {
+//     restoring an empty board - the frontend treats all three the same way.
+//
+// Only the room's scribe calls this (see App.jsx); everyone else receives the
+// resulting shapes through tldraw sync. Messages are queued so two arriving
+// back to back can't each rebuild state before the other has drawn.
+let renderQueue = Promise.resolve()
+
+export function renderSchema(editor, message) {
+  renderQueue = renderQueue.then(() => renderNow(editor, message)).catch((err) => {
+    console.error('[render] failed to render', message?.action, err)
+  })
+  return renderQueue
+}
+
+async function renderNow(editor, message) {
   if (!message) return
+  renderingCount++
+  try {
+    const state = rebuildRenderState(editor)
 
-  if (message.action === 'replace_all') {
-    clearCanvas(editor, state)
-    for (const diagram of message.diagrams ?? []) {
-      await drawDiagram(editor, diagram, state)
+    if (message.action === 'replace_all') {
+      clearCanvas(editor, state)
+      for (const diagram of message.diagrams ?? []) {
+        await drawDiagram(editor, diagram, state)
+      }
+      editor.zoomToFit({ animation: { duration: 300 } })
+      return
     }
-    editor.zoomToFit({ animation: { duration: 300 } })
-    return
-  }
 
-  if ((message.action === 'extend' || message.action === 'new_diagram') && message.diagram) {
-    await drawDiagram(editor, message.diagram, state)
-    editor.zoomToFit({ animation: { duration: 300 } })
+    if ((message.action === 'extend' || message.action === 'new_diagram') && message.diagram) {
+      await drawDiagram(editor, message.diagram, state)
+      editor.zoomToFit({ animation: { duration: 300 } })
+    }
+  } finally {
+    renderingCount--
   }
+}
+
+// True when the document already shows what the backend says it should
+// (or there's nothing to show) - lets a new scribe skip a full redraw that
+// would reset everyone's manual layout tweaks.
+export function boardHasDiagrams(editor) {
+  return editor.getCurrentPageShapes().some((s) => s.meta?.jv)
 }

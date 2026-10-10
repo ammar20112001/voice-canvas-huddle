@@ -1,6 +1,6 @@
 // Captures mic audio and streams fixed-size PCM16 frames to a WebSocket as
-// binary messages - the wire format backend/server.py's /ws/audio endpoint
-// expects (see backend/pipeline.py's Segmenter).
+// binary messages - the wire format backend/server.py's room socket
+// (/api/ws/rooms/<id>) expects (see backend/pipeline.py's Segmenter).
 
 const TARGET_SAMPLE_RATE = 16000
 
@@ -31,8 +31,9 @@ export async function startAudioCapture(ws) {
   const source = audioCtx.createMediaStreamSource(stream)
   const worklet = new AudioWorkletNode(audioCtx, 'pcm-worklet')
 
+  let muted = false
   worklet.port.onmessage = (event) => {
-    if (ws.readyState === WebSocket.OPEN) {
+    if (!muted && ws.readyState === WebSocket.OPEN) {
       ws.send(event.data) // ArrayBuffer of Int16 PCM samples
     }
   }
@@ -41,11 +42,18 @@ export async function startAudioCapture(ws) {
   // don't want to play the mic back out of the speakers.
   source.connect(worklet)
 
-  return function stopAudioCapture() {
-    worklet.port.onmessage = null
-    source.disconnect()
-    worklet.disconnect()
-    stream.getTracks().forEach((track) => track.stop())
-    audioCtx.close()
+  return {
+    // Muting only stops audio going to Jarvis. (Once the call itself is
+    // added, the same toggle should also mute the outgoing call track.)
+    setMuted(value) {
+      muted = value
+    },
+    stop() {
+      worklet.port.onmessage = null
+      source.disconnect()
+      worklet.disconnect()
+      stream.getTracks().forEach((track) => track.stop())
+      audioCtx.close()
+    },
   }
 }

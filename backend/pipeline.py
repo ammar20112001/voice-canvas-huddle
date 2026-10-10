@@ -14,9 +14,11 @@ Shared by:
 import difflib
 import json
 import logging
+import os
 import re
 import time
 
+import httpx
 import numpy as np
 import webrtcvad
 from faster_whisper import WhisperModel
@@ -35,7 +37,16 @@ SILENCE_HANG_FRAMES = SILENCE_HANG_MS // FRAME_MS
 STREAM_FLUSH_MS = 5000             # during continuous speech (no pause), flush for
                                     # transcription this often instead of waiting for silence
 WHISPER_MODEL_SIZE = "base.en"     # try "tiny.en" first if base.en feels slow on your CPU
-LLM_MODEL = "claude-haiku-4-5-20251001"
+LLM_MODEL = "claude-haiku-4-5-20251001"  # used when the provider is "anthropic"
+
+# Which LLM drives the diagramming. "openrouter" is used whenever
+# OPENROUTER_API_KEY is set (unless LLM_PROVIDER overrides it), otherwise
+# "anthropic". See resolve_llm_provider().
+OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+OPENROUTER_DEFAULT_MODEL = "nvidia/nemotron-3-ultra-550b-a55b:free"
+OPENROUTER_MAX_TOKENS = 4000        # headroom in case a model spends some of it on reasoning
+OPENROUTER_TIMEOUT_S = 60
+OPENROUTER_RETRIES = 2              # free models rate-limit (429) and hiccup (5xx) now and then
 
 # Wake word for voice control of drawing - see is_wake_phrase()/is_sleep_phrase().
 WAKE_WORD = "jarvis"
@@ -324,9 +335,78 @@ def build_background_context(transcript_log: list[str], draw_marker_indices: lis
 
 
 # ---------------- Schema generation ----------------
+def resolve_llm_provider() -> tuple[str, str]:
+    """Returns (provider, api_key) from the environment, or raises
+    RuntimeError saying which variable is missing."""
+    provider = (os.environ.get("LLM_PROVIDER") or "").strip().lower()
+    if not provider:
+        provider = "openrouter" if os.environ.get("OPENROUTER_API_KEY") else "anthropic"
+    key_var = {"openrouter": "OPENROUTER_API_KEY", "anthropic": "ANTHROPIC_API_KEY"}.get(provider)
+    if key_var is None:
+        raise RuntimeError(f"LLM_PROVIDER must be 'openrouter' or 'anthropic', got {provider!r}")
+    api_key = os.environ.get(key_var)
+    if not api_key:
+        raise RuntimeError(f"{key_var} is not set (LLM_PROVIDER={provider})")
+    return provider, api_key
+
+
 class DiagramAgent:
-    def __init__(self, api_key: str):
-        self.client = anthropic.Anthropic(api_key=api_key)
+    def __init__(self, provider: str, api_key: str):
+        self.provider = provider
+        self.api_key = api_key
+        if provider == "openrouter":
+            self.model = os.environ.get("OPENROUTER_MODEL") or OPENROUTER_DEFAULT_MODEL
+            self.client = httpx.Client(timeout=OPENROUTER_TIMEOUT_S)
+        else:
+            self.model = LLM_MODEL
+            self.client = anthropic.Anthropic(api_key=api_key)
+        log.info(f"[LLM] provider={provider} model={self.model}")
+
+    def _complete(self, user_content: str) -> tuple[str, int, int]:
+        """One model call. Returns (raw text, input tokens, output tokens)."""
+        if self.provider == "anthropic":
+            resp = self.client.messages.create(
+                model=self.model,
+                max_tokens=1000,
+                system=SYSTEM_PROMPT,
+                messages=[{"role": "user", "content": user_content}],
+            )
+            return resp.content[0].text.strip(), resp.usage.input_tokens, resp.usage.output_tokens
+
+        body = {
+            "model": self.model,
+            "max_tokens": OPENROUTER_MAX_TOKENS,
+            # Voice latency matters more than deliberation here, and this
+            # is a constrained JSON task - skip the model's thinking phase.
+            "reasoning": {"enabled": False},
+            "messages": [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": user_content},
+            ],
+        }
+        headers = {"Authorization": f"Bearer {self.api_key}"}
+        last_error = None
+        for attempt in range(OPENROUTER_RETRIES + 1):
+            if attempt:
+                time.sleep(attempt * 1.5)
+            try:
+                resp = self.client.post(OPENROUTER_URL, json=body, headers=headers)
+            except httpx.HTTPError as e:
+                last_error = e
+                log.warning(f"[LLM] openrouter request failed (attempt {attempt + 1}): {e}")
+                continue
+            if resp.status_code == 429 or resp.status_code >= 500:
+                last_error = RuntimeError(f"openrouter HTTP {resp.status_code}: {resp.text[:200]}")
+                log.warning(f"[LLM] {last_error} (attempt {attempt + 1})")
+                continue
+            resp.raise_for_status()
+            data = resp.json()
+            if data.get("error"):
+                raise RuntimeError(f"openrouter error: {data['error']}")
+            text = (data["choices"][0]["message"].get("content") or "").strip()
+            usage = data.get("usage") or {}
+            return text, usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0)
+        raise RuntimeError(f"openrouter unavailable after {OPENROUTER_RETRIES + 1} attempts: {last_error}")
 
     def generate(self, instruction: str, current_diagrams: list, background_context: str = "") -> dict:
         payload = {
@@ -336,7 +416,7 @@ class DiagramAgent:
         }
         user_content = json.dumps(payload)
         log.info(
-            f"[LLM] sending to {LLM_MODEL}: {len(current_diagrams)} existing diagram(s), "
+            f"[LLM] sending to {self.model}: {len(current_diagrams)} existing diagram(s), "
             f"{len(background_context)} char(s) of background context -> \"{instruction}\""
         )
         log.info(
@@ -344,18 +424,9 @@ class DiagramAgent:
             f"--- user ---\n{json.dumps(payload, indent=2)}"
         )
         t0 = time.perf_counter()
-        resp = self.client.messages.create(
-            model=LLM_MODEL,
-            max_tokens=1000,
-            system=SYSTEM_PROMPT,
-            messages=[{"role": "user", "content": user_content}],
-        )
+        raw, in_tok, out_tok = self._complete(user_content)
         elapsed = time.perf_counter() - t0
-        raw = resp.content[0].text.strip()
-        log.info(
-            f"[LLM] response in {elapsed:.2f}s "
-            f"(in={resp.usage.input_tokens} tok, out={resp.usage.output_tokens} tok)"
-        )
+        log.info(f"[LLM] response in {elapsed:.2f}s (in={in_tok} tok, out={out_tok} tok)")
         log.info(f"[LLM] raw response body:\n{raw}")
 
         cleaned = re.sub(r"^```json|```$", "", raw, flags=re.MULTILINE).strip()

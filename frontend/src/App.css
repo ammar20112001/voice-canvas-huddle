@@ -40,3 +40,68 @@
   flex: 1;
   position: relative;
 }
+
+.center-card {
+  max-width: 420px;
+  margin: 15vh auto 0;
+  padding: 0 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  font-family: system-ui, sans-serif;
+}
+
+.center-card h1 {
+  margin: 0;
+  font-size: 26px;
+}
+
+.center-card p {
+  margin: 0;
+  color: #555;
+  line-height: 1.5;
+}
+
+.center-card input {
+  padding: 10px 12px;
+  font-size: 16px;
+  border: 1px solid #bbb;
+  border-radius: 6px;
+}
+
+.primary {
+  padding: 10px 16px;
+  font-size: 16px;
+  cursor: pointer;
+  border: none;
+  border-radius: 6px;
+  background: #2f6feb;
+  color: #fff;
+}
+
+.primary:disabled {
+  background: #9db6ea;
+  cursor: default;
+}
+
+.error {
+  color: #c0392b !important;
+}
+
+.roster {
+  margin-left: auto;
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.chip {
+  font-size: 13px;
+  padding: 3px 10px;
+  border-radius: 999px;
+  background: #eef0f3;
+}
+
+.chip-you {
+  background: #dbe7ff;
+}
