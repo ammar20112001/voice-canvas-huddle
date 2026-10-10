@@ -8,3 +8,4 @@ setuptools
 fastapi
 uvicorn[standard]
 httpx
+livekit-api

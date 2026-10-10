@@ -4,6 +4,7 @@ import { useSync } from '@tldraw/sync'
 import 'tldraw/tldraw.css'
 import './App.css'
 import { startAudioCapture } from './lib/audioCapture'
+import { startCall } from './lib/call'
 import { boardHasDiagrams, renderSchema } from './lib/diagramRender'
 import { watchForManualEdits } from './lib/diagramSync'
 import { createRoomUrl, jarvisSocketUrl, roomApiUrl, syncUrl } from './lib/endpoints'
@@ -27,6 +28,11 @@ function readName() {
   } catch {
     return ''
   }
+}
+
+function newPeerId() {
+  const bytes = crypto.getRandomValues(new Uint8Array(9))
+  return Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('')
 }
 
 function roomIdFromPath() {
@@ -60,7 +66,7 @@ function Landing() {
   return (
     <div className="center-card">
       <h1>Whiteboard call</h1>
-      <p>Start a call, share the link, and say &ldquo;Start drawing Jarvis&rdquo; to have the diagram drawn for everyone as you talk.</p>
+      <p>Start a call, share the link, and turn Jarvis on to have the diagram drawn for everyone as you talk.</p>
       <button className="primary" onClick={startCall} disabled={busy}>
         {busy ? 'Starting…' : 'Start a call'}
       </button>
@@ -136,6 +142,10 @@ function Board({ roomId, name }) {
   const editorRef = useRef(null)
   const wsRef = useRef(null)
   const captureRef = useRef(null)
+  const callRef = useRef(null)
+  const mutedRef = useRef(false)
+  // One id per tab: the roster id AND the LiveKit identity (see endpoints.js).
+  const [peerId] = useState(newPeerId)
   const stopSyncRef = useRef(null)
   const isScribeRef = useRef(false)
   const followUntilRef = useRef(0)
@@ -143,8 +153,12 @@ function Board({ roomId, name }) {
   const [status, setStatus] = useState('connecting') // connecting | listening | error | closed
   const [room, setRoom] = useState(null)
   const [muted, setMuted] = useState(false)
+  const [jarvisOn, setJarvisOn] = useState(false) // shared by the whole room, owned by the server
   const [copied, setCopied] = useState(false)
   const [attempt, setAttempt] = useState(0) // bump to reconnect
+  const [callState, setCallState] = useState('connecting') // connecting | connected | reconnecting | disconnected | unavailable
+  const [speaking, setSpeaking] = useState(() => new Set())
+  const [playbackBlocked, setPlaybackBlocked] = useState(false)
 
   // Only the scribe lays out and draws - everyone else gets the shapes
   // through tldraw sync. A `resume` (sent to a new scribe) only redraws if
@@ -155,6 +169,11 @@ function Board({ roomId, name }) {
     if (msg.type === 'room') {
       isScribeRef.current = msg.you === msg.scribe
       setRoom(msg)
+      setJarvisOn(!!msg.jarvis)
+      return
+    }
+    if (msg.type === 'jarvis') {
+      setJarvisOn(!!msg.active)
       return
     }
     if (!editor) {
@@ -217,15 +236,45 @@ function Board({ roomId, name }) {
     [name, handleMessage, startWatcher]
   )
 
+  // The audio call. Declared before the Jarvis socket effect on purpose:
+  // that one waits on callRef.current.ready for the shared mic stream.
   useEffect(() => {
-    const ws = new WebSocket(jarvisSocketUrl(roomId, name))
+    const call = startCall({
+      roomId,
+      identity: peerId,
+      name,
+      onSpeakers: setSpeaking,
+      onPlaybackBlocked: setPlaybackBlocked,
+      onState: setCallState,
+    })
+    callRef.current = call
+    if (import.meta.env.DEV) window.__call = call // for browser tests
+    if (mutedRef.current) call.ready.then(() => call.setMuted(true)).catch(() => {})
+    return () => {
+      call.leave()
+      if (callRef.current === call) callRef.current = null
+    }
+  }, [roomId, peerId, name])
+
+  useEffect(() => {
+    const ws = new WebSocket(jarvisSocketUrl(roomId, name, peerId))
     ws.binaryType = 'arraybuffer'
     wsRef.current = ws
     let closedByUs = false
 
     ws.onopen = async () => {
       try {
-        const capture = await startAudioCapture(ws)
+        // Prefer the call's mic so there's one capture and one permission
+        // prompt; if the call couldn't start (LiveKit down, ...), Jarvis
+        // still works from its own mic.
+        let shared = null
+        try {
+          shared = (await callRef.current?.ready)?.stream ?? null
+        } catch (err) {
+          console.warn('[app] call unavailable, Jarvis will use its own mic', err)
+        }
+        const capture = await startAudioCapture(ws, shared)
+        capture.setMuted(mutedRef.current)
         if (closedByUs || ws.readyState !== WebSocket.OPEN) {
           capture.stop() // torn down while the mic prompt was open
           return
@@ -258,12 +307,20 @@ function Board({ roomId, name }) {
       closedByUs = true
       ws.close()
     }
-  }, [roomId, name, attempt, handleMessage, startWatcher])
+  }, [roomId, name, peerId, attempt, handleMessage, startWatcher])
 
   const toggleMute = () => {
     const next = !muted
-    captureRef.current?.setMuted(next)
+    mutedRef.current = next
+    captureRef.current?.setMuted(next) // Jarvis
+    callRef.current?.setMuted(next) // the other participants
     setMuted(next)
+  }
+
+  const toggleJarvis = () => {
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({ type: 'jarvis', active: !jarvisOn }))
+    }
   }
 
   const undo = () => {
@@ -290,10 +347,30 @@ function Board({ roomId, name }) {
         <button onClick={toggleMute} disabled={!live}>
           {muted ? 'Unmute' : 'Mute'}
         </button>
+        <button
+          className={jarvisOn ? 'jarvis-on' : 'jarvis-off'}
+          onClick={toggleJarvis}
+          disabled={!live}
+          title={jarvisOn ? 'Jarvis is drawing what\'s said - click to stop' : 'Have Jarvis draw what\'s said, for everyone'}
+        >
+          {jarvisOn ? '● Stop Jarvis' : 'Start Jarvis'}
+        </button>
         <button onClick={undo} disabled={!live} title="Revert the last change (voice or manual)">
           Undo
         </button>
         <button onClick={() => window.location.assign('/')}>Leave</button>
+        {playbackBlocked && (
+          <button className="attention" onClick={() => callRef.current?.enableAudio()}>
+            Enable call audio
+          </button>
+        )}
+        <span className={`status status-call-${callState}`} title="Audio call">
+          {callState === 'connected'
+            ? 'call: live'
+            : callState === 'unavailable'
+              ? 'call: unavailable (Jarvis only)'
+              : `call: ${callState}`}
+        </span>
         <span className={`status status-${status}`}>
           {status === 'closed' || status === 'error' ? (
             <>
@@ -316,7 +393,7 @@ function Board({ roomId, name }) {
         </span>
         <span className="roster">
           {room?.participants.map((p) => (
-            <span key={p.id} className={`chip${p.id === room.you ? ' chip-you' : ''}`} title={p.id === scribeId ? 'Draws for everyone' : undefined}>
+            <span key={p.id} className={`chip${p.id === room.you ? ' chip-you' : ''}${speaking.has(p.id) ? ' chip-speaking' : ''}`} title={p.id === scribeId ? 'Draws for everyone' : undefined}>
               {p.name}
               {p.id === room.you ? ' (you)' : ''}
               {p.id === scribeId ? ' ✎' : ''}

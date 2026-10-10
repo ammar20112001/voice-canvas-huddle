@@ -16,6 +16,12 @@
 		reverse_proxy 127.0.0.1:5858
 	}
 
+	# LiveKit signalling (the audio call's control channel). Media does NOT
+	# go through here - it's UDP 7882 / TCP 7881 straight to the machine.
+	handle_path /livekit/* {
+		reverse_proxy 127.0.0.1:7880
+	}
+
 	handle {
 		root * {$WHITEBOARD_DIST}
 		try_files {path} /index.html

@@ -9,6 +9,8 @@ carried here - it's synced by the separate Node service in sync-server/
 (tldraw's multiplayer), which asks GET /api/rooms/<id> before accepting a
 connection so only rooms minted here exist.
 
+  browser -> server:  POST /api/rooms/<id>/call-token {identity, name} -> LiveKit
+                       JWT for the audio call (media itself never touches this server).
   browser -> server:  binary WS frames, raw PCM16 audio (16kHz mono). Each
                        participant's mic is its own connection, so each gets
                        its own Segmenter - that's the "who said it" signal.
@@ -16,8 +18,11 @@ connection so only rooms minted here exist.
                        diagram set after a manual edit on the shared board.
                        Ignored if it matches what the room already holds
                        (the scribe's own Jarvis draws echo back this way).
+  browser -> server:  {"type": "jarvis", "active": bool} - turn drawing on/off.
   browser -> server:  {"type": "undo"}
-  server -> browser:  {"type": "room", "you": id, "scribe": id,
+  server -> browser:  {"type": "jarvis", "active": bool} - broadcast whenever the
+                       room's drawing state changes.
+  server -> browser:  {"type": "room", "you": id, "scribe": id, "jarvis": bool,
                        "participants": [{id, name}]} - sent on every join/leave.
   server -> browser:  {"type": "resume", "diagrams": [...]} - to the (new)
                        scribe only, so it can restore a board that's empty.
@@ -27,10 +32,10 @@ connection so only rooms minted here exist.
                        into the shared tldraw document; everyone else gets the
                        shapes through sync. See frontend/src/lib/diagramRender.js.
 
-Drawing is voice-gated ("Jarvis"): nothing is drawn until the wake phrase
-"Start drawing Jarvis" is heard from anyone in the room, and it stops on
-"Stop building Jarvis". Everything said outside that window is kept as
-background context. See is_wake_phrase()/is_sleep_phrase() in pipeline.py.
+Drawing is button-gated ("Jarvis"): nothing is drawn until someone in the
+room turns Jarvis on from the UI ({"type": "jarvis", "active": true}), and
+it stops when anyone turns it off. The state is shared by the whole room.
+Everything said while it's off is kept as background context.
 
 Jarvis keeps a SET of independent diagrams (see SYSTEM_PROMPT in
 pipeline.py). Every change goes through _set_diagrams(), which pushes the
@@ -50,19 +55,19 @@ import re
 import secrets
 import sys
 import time
+from datetime import timedelta
 from pathlib import Path
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import Body, FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from livekit import api as livekit_api
 
 from backend.pipeline import (
     DiagramAgent,
     Segmenter,
     Transcriber,
     build_background_context,
-    is_sleep_phrase,
-    is_wake_phrase,
     resolve_llm_provider,
 )
 
@@ -103,6 +108,16 @@ _agent = DiagramAgent(_llm_provider, _api_key)
 # than letting simultaneous speakers fight for the cores.
 _transcribe_lock = asyncio.Lock()
 
+# LiveKit (the audio call). Dev defaults match deploy/docker-compose.yml and
+# are only safe on localhost - set real values in .env before exposing this.
+_DEV_LIVEKIT_KEY = "devkey"
+_DEV_LIVEKIT_SECRET = "devsecret-change-me-0123456789abcdef"
+LIVEKIT_API_KEY = os.environ.get("LIVEKIT_API_KEY", _DEV_LIVEKIT_KEY)
+LIVEKIT_API_SECRET = os.environ.get("LIVEKIT_API_SECRET", _DEV_LIVEKIT_SECRET)
+if LIVEKIT_API_SECRET == _DEV_LIVEKIT_SECRET:
+    log.warning("[CALL] LIVEKIT_API_SECRET is the development default - set your own before exposing this publicly")
+CALL_TOKEN_TTL = timedelta(hours=6)
+
 MAX_DIAGRAM_HISTORY = 50
 MAX_ROOM_SIZE = int(os.environ.get("MAX_ROOM_SIZE", "6"))
 MAX_ROOMS = int(os.environ.get("MAX_ROOMS", "50"))
@@ -110,9 +125,14 @@ ROOM_IDLE_TTL_S = 24 * 3600
 ROOMS_FILE = Path(os.environ.get("ROOMS_FILE", "data/rooms.json"))
 
 
+_PEER_ID_RE = re.compile(r"^[A-Za-z0-9_-]{6,32}$")
+
+
 class Client:
-    def __init__(self, ws: WebSocket, name: str):
-        self.id = secrets.token_hex(4)
+    def __init__(self, ws: WebSocket, name: str, peer_id: str | None = None):
+        # The browser picks its own id and uses it as its LiveKit identity
+        # too, so "who's speaking in the call" lines up with this roster.
+        self.id = peer_id if peer_id and _PEER_ID_RE.match(peer_id) else secrets.token_hex(4)
         self.ws = ws
         self.name = name
 
@@ -329,7 +349,10 @@ async def _send_roster(room: Room) -> None:
     scribe_id = room.clients[0].id if room.clients else None
     participants = [{"id": c.id, "name": c.name} for c in room.clients]
     for client in list(room.clients):
-        await _send(client, {"type": "room", "you": client.id, "scribe": scribe_id, "participants": participants})
+        await _send(
+            client,
+            {"type": "room", "you": client.id, "scribe": scribe_id, "jarvis": room.active, "participants": participants},
+        )
 
 
 async def _handle_text_message(raw_text: str, room: Room, client: Client) -> None:
@@ -350,6 +373,16 @@ async def _handle_text_message(raw_text: str, room: Room, client: Client) -> Non
         # merge would resurrect anything someone just deleted by hand.
         _set_diagrams(room, diagrams)
         log.info(f"[WS] room {room.id}: adopted manual edit from {client.name} - {len(diagrams)} diagram(s)")
+        return
+
+    if msg_type == "jarvis":
+        active = bool(payload.get("active"))
+        if active != room.active:
+            room.active = active
+            log.info(f"[JARVIS] room {room.id}: {client.name} turned drawing {'on' if active else 'off'}")
+        # Broadcast even when unchanged so a client whose button state was
+        # out of date (two people clicking at once) settles on the truth.
+        await _broadcast(room, {"type": "jarvis", "active": room.active})
         return
 
     if msg_type == "undo":
@@ -388,8 +421,40 @@ def get_room(room_id: str):
     return {"id": room.id, "participants": len(room.clients), "capacity": MAX_ROOM_SIZE}
 
 
+@app.post("/api/rooms/{room_id}/call-token")
+def call_token(room_id: str, body: dict = Body(...)):
+    """Mints a LiveKit access token for this room's audio call. Same trust
+    model as the rest of the app: knowing the room id (the link) is the
+    credential. `identity` is the participant's peer id (see Client)."""
+    room = _rooms.get(room_id)
+    if room is None:
+        raise HTTPException(status_code=404, detail="no such room")
+    identity = str(body.get("identity", ""))
+    if not _PEER_ID_RE.match(identity):
+        raise HTTPException(status_code=400, detail="bad identity")
+    if len(room.clients) >= MAX_ROOM_SIZE and not any(c.id == identity for c in room.clients):
+        raise HTTPException(status_code=403, detail="room is full")
+    token = (
+        livekit_api.AccessToken(LIVEKIT_API_KEY, LIVEKIT_API_SECRET)
+        .with_identity(identity)
+        .with_name(_clean_name(str(body.get("name", ""))))
+        .with_ttl(CALL_TOKEN_TTL)
+        .with_grants(
+            livekit_api.VideoGrants(
+                room_join=True,
+                room=room_id,
+                can_publish=True,
+                can_subscribe=True,
+                can_publish_data=False,
+                can_publish_sources=["microphone"],  # audio-only: no camera/screen even if a client tries
+            )
+        )
+    )
+    return {"token": token.to_jwt()}
+
+
 @app.websocket("/api/ws/rooms/{room_id}")
-async def room_socket(ws: WebSocket, room_id: str, name: str = ""):
+async def room_socket(ws: WebSocket, room_id: str, name: str = "", peer: str = ""):
     room = _rooms.get(room_id)
     if room is None:
         await ws.close(code=4404)
@@ -399,7 +464,16 @@ async def room_socket(ws: WebSocket, room_id: str, name: str = ""):
         return
 
     await ws.accept()
-    client = Client(ws, _clean_name(name))
+    client = Client(ws, _clean_name(name), peer)
+    # A browser reconnecting (or React's dev double-mount) reuses its peer
+    # id before the old socket has finished closing - the newest one wins,
+    # so the roster never shows the same participant twice.
+    for stale in [c for c in room.clients if c.id == client.id]:
+        room.clients.remove(stale)
+        try:
+            await stale.ws.close(code=4000)
+        except Exception:
+            pass
     room.clients.append(client)
     room.last_active = time.time()
     log.info(f"[WS] room {room.id}: {client.name} joined ({len(room.clients)} in room)")
@@ -455,20 +529,6 @@ async def room_socket(ws: WebSocket, room_id: str, name: str = ""):
                     spoken = f"{client.name}: {text}" if len(room.clients) > 1 else text
 
                     async with room.lock:
-                        if is_wake_phrase(text):
-                            room.transcript_log.append(spoken)
-                            if not room.active:
-                                room.active = True
-                                log.info(f"[JARVIS] room {room.id}: wake phrase from {client.name} - now active")
-                            continue
-
-                        if is_sleep_phrase(text):
-                            room.transcript_log.append(spoken)
-                            if room.active:
-                                room.active = False
-                                log.info(f"[JARVIS] room {room.id}: sleep phrase from {client.name} - now inactive")
-                            continue
-
                         if not room.active:
                             room.transcript_log.append(spoken)
                             log.info(f"[JARVIS] inactive, logged as background context: \"{spoken}\"")

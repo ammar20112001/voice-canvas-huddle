@@ -4,15 +4,21 @@
 
 const TARGET_SAMPLE_RATE = 16000
 
-export async function startAudioCapture(ws) {
-  const stream = await navigator.mediaDevices.getUserMedia({
-    audio: {
-      channelCount: 1,
-      sampleRate: TARGET_SAMPLE_RATE,
-      echoCancellation: true,
-      noiseSuppression: true,
-    },
-  })
+// Pass `existingStream` to tap a mic that's already open (the call's) instead
+// of opening a second capture; it is then left running on stop() since the
+// call owns it.
+export async function startAudioCapture(ws, existingStream = null) {
+  const ownsStream = !existingStream
+  const stream =
+    existingStream ??
+    (await navigator.mediaDevices.getUserMedia({
+      audio: {
+        channelCount: 1,
+        sampleRate: TARGET_SAMPLE_RATE,
+        echoCancellation: true,
+        noiseSuppression: true,
+      },
+    }))
 
   const audioCtx = new AudioContext({ sampleRate: TARGET_SAMPLE_RATE })
   if (audioCtx.sampleRate !== TARGET_SAMPLE_RATE) {
@@ -52,7 +58,7 @@ export async function startAudioCapture(ws) {
       worklet.port.onmessage = null
       source.disconnect()
       worklet.disconnect()
-      stream.getTracks().forEach((track) => track.stop())
+      if (ownsStream) stream.getTracks().forEach((track) => track.stop())
       audioCtx.close()
     },
   }

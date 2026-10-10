@@ -1,0 +1,18 @@
+# LiveKit server config - audio-only rooms for 2-6 people.
+#
+# Host networking (see docker-compose.yml) so WebRTC media ports are the
+# machine's own. Only these need to be reachable from the internet in
+# production: 7881/tcp and 7882/udp (plus 80/443 for Caddy). Signalling on
+# 7880 stays on localhost - Caddy exposes it as wss://<domain>/livekit.
+#
+# API key/secret come from the LIVEKIT_KEYS env var ("key: secret"), set by
+# docker-compose.yml from LIVEKIT_API_KEY / LIVEKIT_API_SECRET.
+port: 7880
+bind_addresses:
+  - "127.0.0.1"
+rtc:
+  tcp_port: 7881       # fallback for networks that block UDP
+  udp_port: 7882       # ONE shared UDP port instead of a 10k-port range
+  use_external_ip: false   # production: set true (or set node_ip) so the public IP is advertised
+logging:
+  level: info

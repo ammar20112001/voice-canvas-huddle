@@ -1,0 +1,14 @@
+# LiveKit media server for the audio call.
+#   docker compose -f deploy/docker-compose.yml up -d
+# Reads LIVEKIT_API_KEY / LIVEKIT_API_SECRET from the repo's .env (or the
+# shell); the dev defaults below are only safe on localhost.
+services:
+  livekit:
+    image: livekit/livekit-server:v1.13.9
+    command: --config /etc/livekit.yaml
+    network_mode: host
+    restart: unless-stopped
+    environment:
+      LIVEKIT_KEYS: "${LIVEKIT_API_KEY:-devkey}: ${LIVEKIT_API_SECRET:-devsecret-change-me-0123456789abcdef}"
+    volumes:
+      - ./livekit.yaml:/etc/livekit.yaml:ro

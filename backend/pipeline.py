@@ -11,7 +11,6 @@ Shared by:
   backend/server.py    - WebSocket server, receives PCM16 chunks from a browser
 """
 
-import difflib
 import json
 import logging
 import os
@@ -46,13 +45,7 @@ OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 OPENROUTER_DEFAULT_MODEL = "nvidia/nemotron-3-ultra-550b-a55b:free"
 OPENROUTER_MAX_TOKENS = 4000        # headroom in case a model spends some of it on reasoning
 OPENROUTER_TIMEOUT_S = 60
-OPENROUTER_RETRIES = 2              # free models rate-limit (429) and hiccup (5xx) now and then
-
-# Wake word for voice control of drawing - see is_wake_phrase()/is_sleep_phrase().
-WAKE_WORD = "jarvis"
-WAKE_WORD_SIMILARITY = 0.7          # difflib ratio threshold for a fuzzy "jarvis" match
-WAKE_PHRASE_RE = re.compile(r"\bstart\w*\b.{0,12}?\bdraw\w*\b", re.IGNORECASE)
-SLEEP_PHRASE_RE = re.compile(r"\bstop\w*\b.{0,12}?\bbuild\w*\b", re.IGNORECASE)
+OPENROUTER_RETRIES = 3              # free models rate-limit (429) and get overloaded (5xx) now and then
 
 SYSTEM_PROMPT = """You are Jarvis, a diagramming assistant on a call - like a person with a
 whiteboard who draws when they're told to, not someone transcribing
@@ -286,28 +279,6 @@ class Transcriber:
         return text
 
 
-# ---------------- Wake / sleep phrase detection ----------------
-def _mentions_wake_word(text: str) -> bool:
-    """Fuzzy match instead of exact spelling - "Jarvis" is exactly the kind
-    of proper noun a small ASR model mishears (Jarviss, Jarves, Jervis...)."""
-    for word in re.findall(r"[a-zA-Z']+", text.lower()):
-        if difflib.SequenceMatcher(None, word, WAKE_WORD).ratio() >= WAKE_WORD_SIMILARITY:
-            return True
-    return False
-
-
-def is_wake_phrase(text: str) -> bool:
-    """"Start drawing Jarvis" (tolerant of word order, verb tense, and
-    misspellings of the name) - turns drawing on."""
-    return bool(WAKE_PHRASE_RE.search(text)) and _mentions_wake_word(text)
-
-
-def is_sleep_phrase(text: str) -> bool:
-    """"Stop building Jarvis" (same tolerance as is_wake_phrase) - turns
-    drawing back off."""
-    return bool(SLEEP_PHRASE_RE.search(text)) and _mentions_wake_word(text)
-
-
 # ---------------- Background context assembly ----------------
 DRAW_CHECKPOINT_MARKER = "[[diagram updated up to this point]]"
 
@@ -388,7 +359,7 @@ class DiagramAgent:
         last_error = None
         for attempt in range(OPENROUTER_RETRIES + 1):
             if attempt:
-                time.sleep(attempt * 1.5)
+                time.sleep(attempt * 2)
             try:
                 resp = self.client.post(OPENROUTER_URL, json=body, headers=headers)
             except httpx.HTTPError as e:
@@ -401,8 +372,17 @@ class DiagramAgent:
                 continue
             resp.raise_for_status()
             data = resp.json()
-            if data.get("error"):
-                raise RuntimeError(f"openrouter error: {data['error']}")
+            # OpenRouter can report an upstream failure inside an HTTP 200
+            # body ({"error": {"code": 503, ...}}) - the free providers do
+            # this when overloaded. Same treatment as a real 429/5xx.
+            error = data.get("error")
+            if error or not data.get("choices"):
+                code = error.get("code") if isinstance(error, dict) else None
+                if error and isinstance(code, int) and 400 <= code < 500 and code != 429:
+                    raise RuntimeError(f"openrouter error: {error}")  # our fault (bad key/model/request) - retrying won't help
+                last_error = RuntimeError(f"openrouter upstream error: {error or 'response had no choices'}")
+                log.warning(f"[LLM] {last_error} (attempt {attempt + 1})")
+                continue
             text = (data["choices"][0]["message"].get("content") or "").strip()
             usage = data.get("usage") or {}
             return text, usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0)

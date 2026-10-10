@@ -105,3 +105,28 @@
 .chip-you {
   background: #dbe7ff;
 }
+
+.chip-speaking {
+  box-shadow: 0 0 0 2px #1a7f37;
+}
+
+.attention {
+  background: #fff3cd;
+  border: 1px solid #e0b100;
+}
+
+.status-call-unavailable,
+.status-call-disconnected {
+  color: #c0392b;
+}
+
+.status-call-connected {
+  color: #1a7f37;
+}
+
+.controls button.jarvis-on {
+  background: #1a7f37;
+  border-color: #1a7f37;
+  color: #fff;
+  font-weight: 600;
+}
